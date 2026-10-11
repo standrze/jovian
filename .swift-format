@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "indentation": {
+    "spaces": 4
+  },
+  "lineLength": 120,
+  "maximumBlankLines": 1,
+  "respectsExistingLineBreaks": true,
+  "lineBreakBeforeEachArgument": false,
+  "reflowMultilineStringLiterals": "never",
+  "rules": {
+    "NoAccessLevelOnExtensionDeclaration": false,
+    "UseSynthesizedInitializer": false,
+    "DoNotUseSemicolons": true,
+    "OneCasePerLine": true,
+    "OneVariableDeclarationPerLine": true,
+    "NoEmptyLinesOpeningClosingBraces": true,
+    "OrderedImports": true,
+    "AlwaysUseLowerCamelCase": true,
+    "TypeNamesShouldBeCapitalized": true,
+    "BeginDocumentationCommentWithOneLineSummary": true
+  }
+}

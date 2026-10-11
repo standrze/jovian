@@ -1,0 +1,30 @@
+# contributing
+
+Use Swift 6.4 or later on macOS 13 or later. Read the
+[Swift project style guide](Documentation/SwiftProjectStyle.md) before changing
+source layout or public APIs.
+
+Run commands from `swift-jovian/`; it has its own manifest and build directory:
+
+```sh
+scripts/check-format.sh
+swift test
+swift build --product jovian
+swift run jovian --help
+python3 scripts/smoke.py .build/debug/jovian
+```
+
+Use `scripts/format.sh` to format this package. Avoid reformatting unrelated code.
+Do not run concurrent SwiftPM builds against the same build directory.
+
+Tests belong in `Tests/JovianTests/` for library behavior and
+`Tests/JovianCLITests/` for command parsing and CLI behavior. Cover meaningful
+protocol, logging, and certificate contracts with local fixtures. Network tests
+may require permission to bind loopback sockets in a sandbox.
+
+Keep public APIs documented and reusable. The CLI owns process arguments and
+startup policy; the library owns proxy behavior. Do not add a dependency on the
+parent application or browser merely because these projects share a checkout.
+
+Report formatting, unit tests, networking checks, and platform coverage
+separately. macOS requirements in the manifest do not establish Linux support.
