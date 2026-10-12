@@ -1,4 +1,4 @@
-# working in swift-jovian
+# working in jovian
 
 Read [Documentation/SwiftProjectStyle.md](Documentation/SwiftProjectStyle.md)
 before adding or reorganizing Swift code. Formatting is defined by `.swift-format`

@@ -4,7 +4,7 @@ Use Swift 6.4 or later on macOS 13 or later. Read the
 [Swift project style guide](Documentation/SwiftProjectStyle.md) before changing
 source layout or public APIs.
 
-Run commands from `swift-jovian/`; it has its own manifest and build directory:
+Run commands from `jovian/`; it has its own manifest and build directory:
 
 ```sh
 scripts/check-format.sh

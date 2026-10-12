@@ -28,7 +28,7 @@ Absolute-form HTTPS requests use a verified upstream TLS connection.
 ## Build and test
 
 Requires macOS 13 or later and Swift 6.4. Run these commands from the
-`swift-jovian/` package directory. No separate OpenSSL installation is needed;
+`jovian/` package directory. No separate OpenSSL installation is needed;
 the [certificate guide](certificates.md) explains transitive crypto code.
 
 ```bash

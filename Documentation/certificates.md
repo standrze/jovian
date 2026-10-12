@@ -5,7 +5,7 @@ Jovian uses Apple's [Swift Certificates](https://github.com/apple/swift-certific
 certificate files. [Swift Crypto](https://github.com/apple/swift-crypto) supplies
 the SHA-256 fingerprint implementation.
 
-Run from the `swift-jovian/` package directory:
+Run from the `jovian/` package directory:
 
 ```sh
 swift run jovian certificate /path/to/certificate.pem
