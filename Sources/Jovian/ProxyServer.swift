@@ -29,6 +29,9 @@ public final class ProxyServer: @unchecked Sendable {
     let requestTimeout: TimeInterval
     let proxyName: String
     let viaIdentity: String
+    let session: JovianProxySession?
+    let controlAPI: ControlAPI?
+    let failOnModifierError: Bool
 
     /// Create a server; port zero selects an available port at `start()`.
     ///
@@ -53,7 +56,10 @@ public final class ProxyServer: @unchecked Sendable {
         tlsListenerContext: NIOSSLContext? = nil,
         requestTimeout: TimeInterval = 300,
         connectTimeout: TimeInterval = 30,
-        proxyName: String = "jovian"
+        proxyName: String = "jovian",
+        session: JovianProxySession? = nil,
+        controlAPI: ControlAPI? = nil,
+        failOnModifierError: Bool = false
     ) {
         let transport = ServerTransport()
         self.transport = transport
@@ -66,6 +72,9 @@ public final class ProxyServer: @unchecked Sendable {
         self.requestTimeout = requestTimeout.isFinite ? max(0, requestTimeout) : 300
         self.proxyName = proxyName
         viaIdentity = "\(proxyName)-\(UUID().uuidString.lowercased())"
+        self.session = session
+        self.controlAPI = controlAPI
+        self.failOnModifierError = failOnModifierError
         self.host = host
         self.port = port
         self.modifier = modifier
@@ -162,6 +171,15 @@ public final class ProxyServer: @unchecked Sendable {
                     try await sendError(client, status: 400, reason: "Bad Request", message: "proxy loop detected")
                     return
                 }
+                if let controlAPI, ControlAPI.isReservedTarget(head.uri, head: HTTPHead(head)) {
+                    try await controlAPI.serve(head: head, client: client, workers: transport.workers)
+                    return
+                }
+                try session?.validate(
+                    method: method,
+                    target: head.uri.hasPrefix("/")
+                        ? "\(scheme)://\(head.headers.first(name: "Host") ?? "")\(head.uri)" : head.uri)
+                _ = try HTTPHead(head).validatedFraming()
                 if method == "CONNECT" {
                     try await tunnel(client: client, initialHead: head, started: started, deadline: deadline)
                     return
@@ -190,18 +208,24 @@ public final class ProxyServer: @unchecked Sendable {
                     return
                 }
             } catch {
+                if case TrafficShapingError.recordedClose = error { return }
                 let failure = error as? ProxyExchangeFailure
                 let request =
                     failure?.request ?? receivedRequest
                     ?? RequestContext(method: method, target: target, head: HTTPHead(startLine: ""))
-                let failureDescription = String(describing: failure?.underlying ?? error)
+                let underlying = failure?.underlying ?? error
+                let failureStatus = underlying is SessionScopeError ? 403 : 502
+                let failureReason = failureStatus == 403 ? "Forbidden" : "Bad Gateway"
+                let failureDescription = String(describing: underlying)
                 if !client.finalResponseStarted {
                     var pacer = TransferPacer(bytesPerSecond: nil)
                     do {
                         _ = try await syntheticResponse(
-                            SyntheticResponse(statusCode: 502, reason: "Bad Gateway", body: Data("Bad Gateway".utf8)),
+                            SyntheticResponse(
+                                statusCode: failureStatus, reason: failureReason, body: Data(failureReason.utf8)),
                             request: request, client: client, keepAlive: false, started: started, pacer: &pacer,
-                            error: failureDescription, transportName: method == "CONNECT" ? "tls-tunnel" : "http")
+                            error: failureDescription, transportName: method == "CONNECT" ? "tls-tunnel" : "http",
+                            applyModifiers: !(underlying is ResponseModifierFailure || underlying is SessionScopeError))
                         return
                     } catch {
                         // A closed client cannot receive the error response, but the failed exchange still has a record.

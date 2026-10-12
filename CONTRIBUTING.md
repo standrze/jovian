@@ -28,3 +28,18 @@ parent application or browser merely because these projects share a checkout.
 
 Report formatting, unit tests, networking checks, and platform coverage
 separately. macOS requirements in the manifest do not establish Linux support.
+
+The consolidated wire regressions are deterministic local fixtures by default:
+
+```sh
+python3 scripts/routing-smoke.py
+python3 scripts/mocking-smoke.py
+python3 scripts/martian-completion-smoke.py
+python3 scripts/headers-shaping-smoke.py
+python3 scripts/proxy-upgrades-smoke.py
+python3 scripts/upstream-proxies-smoke.py
+```
+
+`--live` on routing, completion, shaping, and upstream-proxies additionally
+checks public HTTPS certificate verification and nested TLS against example.com.
+Keep these optional outbound checks separate from local validation.

@@ -10,7 +10,8 @@ extension ProxyServer {
     }
 
     func addForwardingHeaders(to request: inout RequestContext, version: HTTPVersion) {
-        request.head.add(name: "Via", value: "\(version.major).\(version.minor) \(viaIdentity)")
+        let hops = request.head.values(for: "Via") + ["\(version.major).\(version.minor) \(viaIdentity)"]
+        request.head["Via"] = hops.joined(separator: ", ")
         if let remoteAddress = request.remoteAddress {
             let previous = request.head["X-Forwarded-For"]
             request.head["X-Forwarded-For"] = [previous, remoteAddress].compactMap { $0 }.joined(separator: ", ")
@@ -21,6 +22,13 @@ extension ProxyServer {
         }
         if request.head["X-Forwarded-Url"] == nil { request.head["X-Forwarded-Url"] = request.target }
     }
+    func ensureVia(_ head: inout HTTPHead) {
+        let present = head.values(for: "Via").joined(separator: ",").split(separator: ",").contains {
+            $0.split(whereSeparator: \.isWhitespace).dropFirst().first == Substring(viaIdentity)
+        }
+        if !present { head.add(name: "Via", value: "1.1 \(viaIdentity)") }
+    }
+
     func addModifierWarning(_ error: Error, to head: inout HTTPHead) {
         let text = String(describing: error).unicodeScalars.filter { $0.value >= 32 && $0.value < 127 }
         let escaped = String(String.UnicodeScalarView(text)).replacingOccurrences(of: "\\", with: "\\\\")

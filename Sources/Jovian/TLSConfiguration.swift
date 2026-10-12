@@ -17,6 +17,7 @@ public final class ProxyTLSConfiguration: Sendable {
         var configuration = NIOSSL.TLSConfiguration.makeClientConfiguration()
         configuration.applicationProtocols = ["http/1.1"]
         configuration.minimumTLSVersion = .tlsv12
+        configuration.shutdownTimeout = .milliseconds(100)
         if let trustRootsPEM {
             let roots = try NIOSSLCertificate.fromPEMBytes(Array(trustRootsPEM))
             guard !roots.isEmpty else { throw ProxyTLSError.emptyCertificateChain }
@@ -40,6 +41,7 @@ public final class ProxyTLSConfiguration: Sendable {
             certificateChain: certificates.map { .certificate($0) }, privateKey: .privateKey(key))
         configuration.applicationProtocols = ["http/1.1"]
         configuration.minimumTLSVersion = .tlsv12
+        configuration.shutdownTimeout = .milliseconds(100)
         return try NIOSSLContext(configuration: configuration)
     }
 }

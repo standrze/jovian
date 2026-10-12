@@ -35,3 +35,24 @@ TLS transport now uses Apple's maintained SwiftNIO SSL package. Certificate
 issuance and explicit trust policy are independent of the metadata inspection
 command. The implementation keeps cryptographic primitives and TLS handshakes in
 maintained packages rather than implementing them in application code.
+
+## Consolidation, 2026-10-11
+
+Jovian 0.3.0 consolidates the published Jovian main revision
+`680422e76e5f56e858a5a70e65e00c9c37ff15fa` with the newer local Relay/Reed
+working tree based on `9e974b4f441dc5913774a150dea6c03c2e7444d5`.
+The latter included uncommitted development beyond the initial import;
+commit dates alone therefore did not identify the newest features.
+
+The consolidation retains Jovian's SwiftNIO transport, request deadlines,
+connection pool, bounded drain, Swift Certificates authority, certificate
+inspection, ArgumentParser CLI, and original regression suite. It ports the
+newer canonical rule registry, conditional routing, verifiers, static files and
+ranges, bounded streaming diagnostics, HAR capture policy, traffic shaping,
+shared control routes, SOCKS negotiation, and origin-scoped sessions into that
+engine. The custom Reed socket/OpenSSL transport is not part of this package.
+The sole C boundary is the system zlib module for bounded diagnostic inflation.
+
+Jovian is the canonical library, executable, and repository name. Historical
+`REED_SESSIONS_DIR` / `RELAY_SESSIONS_DIR` and existing session directories remain
+readable; new stores use `JOVIAN_SESSIONS_DIR` or `~/.jovian/sessions`.

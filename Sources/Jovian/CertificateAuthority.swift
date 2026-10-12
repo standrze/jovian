@@ -171,7 +171,9 @@ public final class CertificateAuthority: @unchecked Sendable {
         let chain = Data(try leaf.serializeAsPEM().pemString.utf8) + Data("\n".utf8) + certificatePEM
         let context = try ProxyTLSConfiguration.serverContext(
             certificatePEM: chain, privateKeyPEM: Data(key.pemRepresentation.utf8))
-        let identity = ServerIdentity(context: context, certificateChainPEM: chain, expires: expires)
+        let identity = ServerIdentity(
+            context: context, certificateChainPEM: chain, privateKeyPEM: Data(key.pemRepresentation.utf8),
+            expires: expires)
         while cache.count >= cacheCapacity, let oldest = insertionOrder.popFirst() {
             cache.removeValue(forKey: oldest)
         }
@@ -216,6 +218,41 @@ public final class CertificateAuthority: @unchecked Sendable {
     private struct ServerIdentity {
         let context: NIOSSLContext
         let certificateChainPEM: Data
+        let privateKeyPEM: Data
         let expires: Date
+    }
+}
+
+extension CertificateAuthority {
+    /// Loads a persistent authority without changing system trust.
+    public convenience init(directory: URL) throws {
+        try self.init(
+            certificatePEM: Data(contentsOf: directory.appendingPathComponent("ca-cert.pem")),
+            privateKeyPEM: Data(contentsOf: directory.appendingPathComponent("ca-key.pem")))
+    }
+
+    /// Creates a new authority; existing identity files are never overwritten.
+    public static func create(directory: URL) throws {
+        let manager = FileManager.default
+        try manager.createDirectory(
+            at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let certificate = directory.appendingPathComponent("ca-cert.pem")
+        let key = directory.appendingPathComponent("ca-key.pem")
+        guard !manager.fileExists(atPath: certificate.path), !manager.fileExists(atPath: key.path) else {
+            throw ProxyError.certificate("CA identity already exists")
+        }
+        let authority = try generate()
+        try authority.privateKeyPEM.write(to: key, options: .withoutOverwriting)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: key.path)
+        do { try authority.certificatePEM.write(to: certificate, options: .withoutOverwriting) } catch {
+            try? manager.removeItem(at: key)
+            throw error
+        }
+    }
+
+    /// Exports a matching leaf chain and key for explicitly configured local TLS listeners.
+    public func exportIdentity(for hostname: String) throws -> (certificateChainPEM: Data, privateKeyPEM: Data) {
+        let value = try identity(for: hostname)
+        return (value.certificateChainPEM, value.privateKeyPEM)
     }
 }

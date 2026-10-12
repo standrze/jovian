@@ -170,6 +170,24 @@ final class ChannelConnection: @unchecked Sendable {
         }.get()
     }
 
+    private var shapedUploadStarted = false
+    private var shapedDownloadStarted = false
+
+    func beginShaping(upload: Bool) async throws -> Bool {
+        try await channel.eventLoop.submit {
+            if upload {
+                defer { self.shapedUploadStarted = true }
+                return !self.shapedUploadStarted
+            }
+            defer { self.shapedDownloadStarted = true }
+            return !self.shapedDownloadStarted
+        }.get()
+    }
+
+    func prependRaw(_ bytes: ByteBuffer) async throws {
+        try await channel.eventLoop.submit { self.inbox.prependRaw(bytes) }.get()
+    }
+
     func finishOutput() async { try? await channel.close(mode: .output).get() }
     func close() { channel.close(promise: nil) }
 }
@@ -214,6 +232,10 @@ private final class ConnectionInbox: ChannelInboundHandler, @unchecked Sendable 
         ended = false
         reading = false
         return (bytes, inputClosed)
+    }
+
+    func prependRaw(_ bytes: ByteBuffer) {
+        events.prepend(.bytes(bytes))
     }
 
     func channelActive(context: ChannelHandlerContext) {

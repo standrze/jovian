@@ -1,9 +1,9 @@
 # Martian compatibility target
 
-Jovian's compatibility reference is the pinned `google/martian` commit
+Jovian targets the final archived `google/martian` `master` commit
 [`0f7e6797a04da412118541344bbe0d65945e24c9`](https://github.com/google/martian/tree/0f7e6797a04da412118541344bbe0d65945e24c9)
-(Martian v3 source; the original audit recorded 2022-08-16). This document was
-derived from that source tree, especially `cmd/proxy/main.go`, `parse/parse.go`, and every call to
+(Martian v3 source, 2022-08-16). This document is derived from that source tree,
+especially `cmd/proxy/main.go`, `parse/parse.go`, and every call to
 `parse.Register`.
 
 Status meanings:
@@ -14,108 +14,92 @@ Status meanings:
 
 Having a generally similar proxy feature does not count as Martian compatibility.
 
-The proxy engine work and executable regression coverage are tracked separately
-in [ProxyEngineParity.md](ProxyEngineParity.md). The remaining JSON/control-plane
-registry is outside that engine comparison.
-
 ## Proxy binary and control API
 
 | Martian capability | Jovian | Evidence / gap |
 |---|---|---|
 | HTTP forward proxy | Implemented | Absolute-form HTTP requests are forwarded and logged. |
-| HTTPS `CONNECT` tunnel | Implemented | TLS bytes pass between client and destination without decryption. |
-| Dynamic TLS MITM | Implemented for HTTP/1.1 | Explicit CA generation/loading, cached DNS/IP identities, SNI selection, and local interception tests. |
-| Persistent client connections | Implemented | Plain HTTP/1.1 accepts sequential and pipelined requests. |
-| Runtime `POST /configure` | Partial | Jovian replaces configuration atomically and accepts its own schema plus five canonical `package.Type` nodes. Full registry and API parity are incomplete. |
+| HTTPS `CONNECT` tunnel | Implemented | Tunneling is the default when no interception CA is configured. |
+| Dynamic TLS MITM | Partial | Dynamic host certificates and validated upstream TLS work. Jovian retains ephemeral CA generation and native X.509 validity/cache checks. CLI spelling and transparent TCP redirection differ. |
+| Via and loop detection | Implemented | Per-instance request Via identities preserve hop history, reject returning traffic before origin contact, and propagate through next-hop CONNECT. Protected against header-rule deletion. |
+| Persistent client connections | Implemented | Plain and intercepted HTTP/1.1 accept sequential and pipelined requests. |
+| Runtime `POST /configure` | Partial | Atomic replacement accepts native Jovian rules and the explicit canonical subset below; unsupported types fail. |
 | `GET /configure` | Jovian extension | Martian's modifier handler supports GET, but its representation and behavior need compatibility tests. |
-| API through `http://martian.proxy/...` | Missing | Jovian exposes only the separate admin listener; it does not route the reserved proxy hostname to the API. |
-| `GET /authority.cer` | Missing | CA export through both the API listener and reserved proxy hostname is absent. |
-| `GET /verify`, reset | Partial | Endpoints exist, but only Jovian's top-level status/header rules feed them. Composable Martian verifiers are absent. |
-| HAR `GET /logs`, reset | Partial | Endpoints and HAR 1.2 exist. Jovian deliberately omits bodies, uses bounded retention, and does not match Martian's full capture semantics. |
-| Configurable logging modifier | Partial | Console/JSONL logging and bounded traffic body snapshots exist, but `log.Logger` JSON, `headersOnly`, and `decode` are absent. HAR still omits bodies. |
-| `POST /shape-traffic` | Partial | Jovian has global upload/download byte rates and delays, not Martian's defaults, latency, URL regex shapes, byte ranges, halts, forced closes, or global bandwidth buckets. |
-| API CORS flag | Missing | Jovian has a response CORS modifier, not Martian's CORS wrapper for control endpoints. |
-| Direct TLS proxy listener (`-tls-addr`) | Implemented | `--tls-port` enables a TLS listener with SNI-selected identities. |
-| Downstream proxy chaining | Implemented | `--downstream-proxy-url` supports HTTP/HTTPS next hops, credentials, absolute HTTP forwarding and CONNECT. |
-| Optional insecure upstream TLS | Implemented | Validation is enabled by default; `--skip-tls-verify` and `--upstream-ca` explicitly configure upstream trust. |
+| API through `http://martian.proxy/...` | Implemented | Shared control routes bypass origin DNS, modifiers, and traffic logs; proxy authentication is enforced. |
+| `GET /authority.cer` | Implemented | PEM CA export with Martian content type on admin and reserved proxy routes; no private key exposure. Absent CA returns 404. |
+| `GET /verify`, reset | Partial | Composable canonical verifiers and legacy host rules feed `/verify`; reset clears failures and re-arms pingbacks. Jovian uses bounded retention and redacted diagnostic strings. |
+| HAR `GET /logs`, reset | Partial | Endpoints and HAR 1.2 exist. Optional bounded body capture supports JSON/form field redaction, binary base64, and truncation markers. Default retention omits bodies. Jovian does not match Martian's full capture semantics. |
+| Configurable logging modifier | Partial | Canonical `log.Logger`, `headersOnly`, and bounded gzip/deflate decoding work at the modifier position, with redaction. Streaming bodies use bounded deferred payload tees with interruption/truncation markers; text format and snapshot timing differ. |
+| `POST /shape-traffic` | Partial | Canonical defaults, latency, URL regex policies, byte throttles, halts, closes, and aggregate limits have unit/wire coverage. Strict pacing, ICU, decoded chunk offsets, policy replacement, and corrected up/down labels differ from the pinned implementation. |
+| API CORS flag | Implemented | Opt-in `--api-cors` handles Origin and preflight headers on both control paths. |
+| Direct TLS proxy listener (`-tls-addr`) | Partial | Static or CA-backed SNI identities accept absolute-form HTTP/HTTPS, origin-form HTTPS, control requests, and CONNECT. Explicit interception CA enables nested TLS MITM. No transparent TCP redirection; Jovian CLI flags differ. |
+| Downstream proxy chaining | Partial | `--upstream-proxy` / `--downstream-proxy-url` supports HTTP, HTTPS, and SOCKS5 (`socks5`/`socks5h`) next hops for HTTP, CONNECT, and intercepted HTTPS. Separate Basic/SOCKS credentials; optional HTTPS proxy CA file. Proxy and origin TLS validate independently; SOCKS hostnames resolve remotely. SOCKS4, GSSAPI, BIND, and UDP are absent. |
+| Optional insecure upstream TLS | Implemented | Verification is enabled by default. Existing `--skip-tls-verify` and `--upstream-ca` remain available for explicit test configurations; `--upstream-proxy-ca` configures next-hop trust separately. |
 | Proxy authentication | Partial | Jovian supports startup Basic credentials; Martian's `proxyauth` library behavior/API is not mirrored. |
-| Graceful shutdown | Implemented with a finite bound | `shutdown(gracePeriod:)` drains current requests and rejects new work. The CLI drains on SIGINT/SIGTERM. Immediate `stop()` remains available. |
+| Graceful shutdown | Implemented | SIGINT/SIGTERM stops listeners and idle clients, drains active connections to a configurable deadline, then interrupts transport and shaping waits. Library `shutdown(gracePeriod:)` waits for the bounded drain. |
 
 ## Registered Martian JSON types
 
-The original source audit recorded these 33 registered types in the pinned
-Martian source. Jovian currently accepts five under the canonical one-key
-envelope: `fifo.Group`, `header.Modifier`, `status.Modifier`, `body.Modifier`, and
-`querystring.Modifier`. Parser and modifier tests exercise those nodes, but their
-rows remain partial until the full semantics and integration acceptance rule
-below are satisfied. Unknown types are rejected.
+Martian registers exactly these 33 types in the pinned source. Jovian now parses
+all 33 names under the canonical one-key envelope, with the behavioral limits
+listed below. Parser coverage alone does not establish full compatibility. Routing behavior, deliberate differences,
+and verification commands are documented in [Routing](Routing.md) and
+[Mocking and verification](MockingAndVerification.md), [Headers and traffic shaping](HeadersAndTrafficShaping.md), and
+[Cookies, priority, logging, and listeners](MartianCompletion.md), and
+[Proxy upgrades](ProxyUpgrades.md).
 
 | Registered type | Jovian | Compatibility gap |
 |---|---|---|
-| `body.Modifier` | Partial | Canonical base64 `body` is accepted up to 1 MiB; Jovian's own schema also accepts UTF-8 `content`. Martian range-response behavior is not implemented. |
-| `cookie.Filter` | Missing | No cookie-conditioned true/else filter. |
-| `cookie.Modifier` | Partial | Basic set/remove exists; Martian appends cookies and accepts path, domain, expiry, secure, HTTP-only, and max-age. |
-| `failure.Verifier` | Missing | Jovian's synthetic failure response is unrelated; Martian records a verifier error whenever traffic reaches this node. |
-| `fifo.Group` | Partial | Canonical ordered grouping and scope are accepted; `aggregateErrors: true` is explicitly unsupported. Full Martian composition semantics need integration coverage. |
-| `header.Append` | Missing | Jovian replaces all values rather than appending another field value. |
-| `header.Blacklist` | Missing | No configurable header deletion list. |
-| `header.Copy` | Missing | No copy-from/copy-to modifier. |
-| `header.Filter` | Missing | No exact header true/else filter. |
-| `header.Id` | Missing | No stable per-request `X-Martian-ID` equivalent. |
-| `header.Modifier` | Partial | Canonical name/value and scope plus Jovian's own schema are accepted. Full Martian header behavior needs integration coverage. |
-| `header.RegexFilter` | Missing | No request-header regular-expression filter. |
-| `header.Verifier` | Partial | Host-scoped top-level expectations exist, not a composable scoped verifier. |
-| `log.Logger` | Partial | Logging exists outside the modifier tree; canonical options and body logging are absent. |
-| `method.Filter` | Partial | Method filtering exists, but schema, exact one-method semantics, scope, and `else` differ. |
-| `method.Verifier` | Missing | No composable method verifier. |
-| `noop.Modifier` | Missing | No canonical no-op node. |
-| `pingback.Verifier` | Missing | No verifier that begins failed and passes after a matching URL is observed. |
-| `port.Filter` | Missing | No URL-port-conditioned filter. |
-| `port.Modifier` | Missing | No port set/default/remove URL and Host modifier. |
-| `priority.Group` | Missing | No numeric-priority modifier group. |
-| `querystring.Filter` | Missing | No query-conditioned true/else filter. |
-| `querystring.Modifier` | Partial | Canonical name/value and request scope are accepted; Jovian's own schema additionally supports removal. Full Martian behavior needs integration coverage. |
-| `querystring.Verifier` | Missing | No composable query verifier. |
-| `skip.RoundTrip` | Missing | Synthetic responses can avoid an origin connection, but do not implement Martian's context-driven skip-round-trip primitive. |
-| `stash.Modifier` | Missing | No request-URL snapshot copied through a named header into the response. |
-| `static.Modifier` | Missing | No rooted local-file response modifier or explicit path map. |
-| `status.Modifier` | Partial | Canonical status code and response scope plus Jovian's own schema are accepted. Full Martian behavior needs integration coverage. |
-| `status.Verifier` | Partial | Host-scoped top-level expected status exists, not a composable scoped verifier. |
-| `url.Filter` | Partial | Jovian supports host plus path-prefix matching; Martian matches optional scheme, host, exact path, and raw query with true/else branches. |
-| `url.Modifier` | Missing | No scheme/host/path/raw-query URL replacement. |
-| `url.RegexFilter` | Missing | No RE2-compatible full-URL regular-expression filter. |
-| `url.Verifier` | Missing | No composable scheme/host/path/query verifier. |
+| `body.Modifier` | Partial | Canonical base64 and native UTF-8 replacements support streaming originals, HEAD metadata, and single/suffix/open/multipart ranges. Strict range validation and a 16-range cap differ from pinned Go behavior. |
+| `cookie.Filter` | Partial | Canonical scoped true/else rules match request Cookie and response Set-Cookie names/values. Full Go cookie parsing parity is not claimed. |
+| `cookie.Modifier` | Partial | Canonical append and path/domain/RFC3339 expiry/Secure/HttpOnly/MaxAge attributes work with unit/wire coverage. Invalid values are rejected rather than silently sanitized/dropped as in Go. Native set/remove remains distinct. |
+| `failure.Verifier` | Implemented | Canonical request-scoped node records an error whenever reached, without changing the HTTP response; wire-tested with resettable bounded retention. |
+| `fifo.Group` | Implemented | Canonical ordered scoped composition supports fail-fast or ordered request/response error aggregation. Jovian returns 502 for modifier errors; exact error formatting differs. |
+| `header.Append` | Partial | Canonical scoped append preserves duplicates/order with unit/wire coverage; Host/Content-Length/Transfer-Encoding use Martian field semantics; wire framing remains transport-owned. |
+| `header.Blacklist` | Partial | Canonical scoped names delete all case-insensitive values with unit/wire coverage; Host/Content-Length/Transfer-Encoding use Martian field semantics; wire framing remains transport-owned. |
+| `header.Copy` | Partial | Canonical scoped from/to uses the first source value and copies missing sources as empty; unit/wire coverage. Host/Content-Length/Transfer-Encoding use Martian field semantics; wire framing remains transport-owned. |
+| `header.Filter` | Partial | Canonical scoped true/else matching checks duplicate header values. Omitted value matches an empty value as in the pinned source; special-field presence/value matching includes zero-length semantics. |
+| `header.Id` | Implemented | Canonical request-only ID uses the exchange UUID and preserves nonempty caller IDs. Native response echo correlates request/response/HAR; keep-alive and wire coverage. |
+| `header.Modifier` | Partial | Canonical and native scoped replacement work; Host and length/encoding field semantics work; outgoing framing is normalized to actual bodies. |
+| `header.RegexFilter` | Partial | Canonical header/regex fields and request-header matching on response work. ICU with a time budget replaces RE2; matching considers all duplicate values. Native match supports else. |
+| `header.Verifier` | Partial | Canonical composable request/response verifier supports presence and duplicate exact values. Special fields use Martian presence semantics; error text differs and legacy host rules remain available. |
+| `log.Logger` | Partial | Canonical scope, headersOnly, decode, filters, and bounded/redacted buffered-body snapshots work. Streaming payload snapshots are deferred and bounded; exact Go dump/error semantics differ. |
+| `method.Filter` | Partial | Canonical one-method, case-insensitive, scoped true/else matching exists alongside native multi-method rules; wire-level Martian parity coverage remains limited. |
+| `method.Verifier` | Implemented | Canonical request-scoped, case-sensitive method expectation records failures without blocking; wire-tested. |
+| `noop.Modifier` | Implemented | Canonical scoped no-op preserves ordinary forwarding with unit/wire coverage. |
+| `pingback.Verifier` | Implemented | Canonical nonempty URL fields match exactly. Pending before traffic, sticky success, reset re-arms, and unreached nested nodes remain pending; unit/wire coverage. |
+| `port.Filter` | Partial | Canonical effective-port matching includes implicit 80/443 and IPv6; native match also supports else. Integration parity coverage remains limited. |
+| `port.Modifier` | Implemented | Canonical set/default/remove modes update URL and Host, with IPv6 and real forwarding coverage. Invalid/conflicting modes are rejected. |
+| `priority.Group` | Implemented | Canonical numeric priorities sort descending; later declarations win ties, in both directions, with scoped children. Unit/wire coverage. |
+| `querystring.Filter` | Implemented | Canonical scoped true/else checks exact decoded names and any repeated value; omitted/empty value tests presence. |
+| `querystring.Modifier` | Partial | Canonical set-value and native set/remove work; raw encoding parity is not fully verified. |
+| `querystring.Verifier` | Partial | Canonical presence/any-value matching handles query plus buffered URL-encoded POST/PUT/PATCH forms and plus decoding. Streaming forms record an unavailable-body failure; exact Go form/error parity is not claimed. |
+| `skip.RoundTrip` | Implemented | Canonical request-scoped flag skips the origin and supplies an empty 200 for response modifiers. Wire checks cover body/status composition and unread-upload closure. |
+| `stash.Modifier` | Implemented | Canonical headerName snapshots current request URL and echoes that request header on response. Response-only scope is rejected. Valid header names are required. Unit/wire coverage. |
+| `static.Modifier` | Partial | Canonical rooted regular files bypass origin contact. HEAD and single/multipart ranges work; files over 4 MiB use bounded descriptor reads. Traversal/symlinks are rejected. No directory listing or conditional caching. |
+| `status.Modifier` | Partial | Canonical statusCode and native status replacement exist; full reason-phrase parity is not claimed. |
+| `status.Verifier` | Partial | Canonical composable response status verification has unit/wire coverage; diagnostics are bounded/redacted and differ from Martian. Legacy host rules remain available. |
+| `url.Filter` | Partial | Canonical scheme/authority/exact-path/raw-query true/else rules exist. Host matching is case-insensitive and supports whole-label wildcards rather than all Martian wildcard forms. |
+| `url.Modifier` | Partial | Canonical nonempty scheme/authority/path/raw-query rewriting routes before DNS. Session scope is rechecked, and unchanged origin credentials are stripped on origin changes. |
+| `url.RegexFilter` | Partial | Canonical scoped URL regex with true/else exists; Foundation/ICU and a 50 ms per-value budget replace Go RE2. |
+| `url.Verifier` | Partial | Canonical request verifier checks nonempty scheme/authority/decoded-path/raw-query fields. Host wildcard behavior follows Jovian URL filters rather than every Martian wildcard form. |
 
 ## Programmatic packages outside the JSON registry
 
 The Martian source also includes library-level behavior not represented by the
 33 registered JSON names. Important compatibility areas include `auth`, `cors`,
-`h2`, `har`, `httpspec`, `ipauth`, `messageview`, `mitm`, `proxyauth`,
+`h2`, `har`, `httpspec`, `ipauth`, `marbl`, `messageview`, `mitm`, `proxyauth`,
 `servemux`, `trafficshape`, and request `Context` state. These must be audited
 separately; their presence in Martian does not imply they are enabled by the
-stock proxy binary. MARBL is a stock opt-in `-marbl` feature with a `/binlogs`
-endpoint; Jovian does not implement that logging format.
+stock proxy binary.
 
-## Implementation order
+## Remaining compatibility work
 
-1. **Canonical parser and composition core** — extend the existing one-key
-   envelope, scope, and five supported nodes with remaining composition semantics
-   and Martian-style true/`else` filters. Complete integration fixtures for
-   `fifo.Group` and its child modifiers.
-2. **Control-plane compatibility** — reserved `martian.proxy` routing,
-   `/configure`, `/verify`, reset routes, `/logs`, and `/authority.cer` on both
-   proxy and API listeners.
-3. **Core mutation/filter parity** — header family, URL/query/method/cookie
-   filters and modifiers, status/body, priority, port, stash, no-op, and skip.
-4. **Verifier parity** — header, status, method, URL, query, failure, and
-   pingback with correct reset/initial-state behavior.
-5. **Mocking and observability** — static files, modifier logging, full optional
-   HAR capture, and API CORS.
-6. **Network API parity** — Martian traffic-shape schema/actions. Chaining,
-   direct TLS, interception, deadlines, and bounded draining are covered by the
-   separate engine implementation and regression tests.
-7. **Library-only review** — decide explicitly whether `h2`, MARBL, mobile,
-   and other non-stock-binary packages belong in Jovian's compatibility promise.
+The canonical registry and control-plane consolidation are implemented with the
+limits above. Remaining work includes exact Go/RE2 matching and encoding
+semantics, full HAR/text-log equivalence, conditional static-file caching, and
+explicit decisions about HTTP/2, MARBL, mobile, and library-only APIs. Parsing
+all 33 names does not imply full Martian parity.
 
 ## Acceptance rule
 

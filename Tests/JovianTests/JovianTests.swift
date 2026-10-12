@@ -113,12 +113,12 @@ final class JovianTests: XCTestCase {
         var request = RequestContext(
             method: "GET", target: "http://example.com/",
             head: HTTPHead(startLine: "GET / HTTP/1.1"))
-        runtime.modify(request: &request)
+        try runtime.modify(request: &request)
         XCTAssertEqual(request.head["X-Runtime"], "request")
         var response = ResponseContext(
             requestMethod: "GET", target: request.target,
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"))
-        runtime.modify(response: &response)
+        try runtime.modify(response: &response)
         XCTAssertEqual(response.head["X-Runtime"], "response")
         runtime.record(
             TrafficEntry(
@@ -213,13 +213,13 @@ final class JovianTests: XCTestCase {
         var matching = RequestContext(
             method: "GET", target: "https://example.com/path",
             head: HTTPHead(startLine: "GET /path HTTP/1.1"))
-        runtime.modify(request: &matching)
+        try runtime.modify(request: &matching)
         XCTAssertEqual(matching.head["X-Global"], "yes")
         XCTAssertEqual(matching.head["X-Filtered"], "yes")
         var other = RequestContext(
             method: "GET", target: "https://other.test/path",
             head: HTTPHead(startLine: "GET /path HTTP/1.1"))
-        runtime.modify(request: &other)
+        try runtime.modify(request: &other)
         XCTAssertEqual(other.head["X-Global"], "yes")
         XCTAssertNil(other.head["X-Filtered"])
         let encoded = try JSONEncoder().encode(runtime.snapshot())
@@ -251,13 +251,13 @@ final class JovianTests: XCTestCase {
             requestMethod: "GET", target: "https://example.com/api/items",
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"))
         let start = ContinuousClock.now
-        runtime.modify(response: &matching)
+        try runtime.modify(response: &matching)
         XCTAssertEqual(matching.head.startLine, "HTTP/1.1 418 Teapot")
         XCTAssertGreaterThanOrEqual(start.duration(to: .now), .milliseconds(4))
         var wrongMethod = ResponseContext(
             requestMethod: "POST", target: matching.target,
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"))
-        runtime.modify(response: &wrongMethod)
+        try runtime.modify(response: &wrongMethod)
         XCTAssertEqual(wrongMethod.head.startLine, "HTTP/1.1 200 OK")
         XCTAssertThrowsError(
             try RuntimeConfiguration().replace(
@@ -298,7 +298,7 @@ final class JovianTests: XCTestCase {
             head: HTTPHead(
                 startLine: "GET /path HTTP/1.1",
                 headers: [("Cookie", "session=old; untouched=value")]))
-        runtime.modify(request: &request)
+        try runtime.modify(request: &request)
         let components = URLComponents(string: request.target)
         XCTAssertEqual(components?.queryItems?.first(where: { $0.name == "page" })?.value, "two words")
         XCTAssertEqual(components?.queryItems?.first(where: { $0.name == "keep" })?.value, "yes")
@@ -312,7 +312,7 @@ final class JovianTests: XCTestCase {
                     ("Set-Cookie", "theme=light; Path=/; Secure"),
                     ("Set-Cookie", "other=preserved; HttpOnly"),
                 ]))
-        runtime.modify(response: &response)
+        try runtime.modify(response: &response)
         XCTAssertEqual(
             response.head.values(for: "Set-Cookie"),
             ["theme=dark; Path=/; Secure", "other=preserved; HttpOnly"])
@@ -324,12 +324,12 @@ final class JovianTests: XCTestCase {
                     .queryString(name: "page", value: nil),
                     .cookie(scope: ["request", "response"], name: "session", value: nil),
                 ])))
-        removal.modify(request: &request)
+        try removal.modify(request: &request)
         XCTAssertNil(URLComponents(string: request.target)?.queryItems?.first(where: { $0.name == "page" }))
         XCTAssertEqual(request.head["Cookie"], "untouched=value")
     }
 
-    func testBodyModifierRespectsScopeAndStreamingFallback() throws {
+    func testBodyModifierRespectsScopeAndReplacesStreamingBodies() throws {
         let runtime = RuntimeConfiguration()
         try runtime.replace(
             with: RuntimeConfigurationDocument(
@@ -339,25 +339,25 @@ final class JovianTests: XCTestCase {
             method: "POST", target: "http://example.com/",
             head: HTTPHead(startLine: "POST / HTTP/1.1"),
             body: Data("original".utf8))
-        runtime.modify(request: &request)
+        try runtime.modify(request: &request)
         XCTAssertEqual(String(data: request.body!, encoding: .utf8), "replacement")
         XCTAssertEqual(request.head["Content-Type"], "text/plain")
         var response = ResponseContext(
             requestMethod: "POST", target: request.target,
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"),
             body: Data("old response".utf8))
-        runtime.modify(response: &response)
+        try runtime.modify(response: &response)
         XCTAssertEqual(String(data: response.body!, encoding: .utf8), "replacement")
         var streamed = ResponseContext(
             requestMethod: "GET", target: request.target,
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"), body: nil)
-        runtime.modify(response: &streamed)
-        XCTAssertNil(streamed.body)
+        try runtime.modify(response: &streamed)
+        XCTAssertEqual(streamed.body, Data("replacement".utf8))
         var headResponse = ResponseContext(
             requestMethod: "HEAD", target: request.target,
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"), body: Data())
-        runtime.modify(response: &headResponse)
-        XCTAssertEqual(headResponse.body, Data())
+        try runtime.modify(response: &headResponse)
+        XCTAssertEqual(headResponse.body, Data("replacement".utf8))
     }
 
     func testTargetedFailureAndRuntimeTrafficRates() throws {
@@ -374,14 +374,14 @@ final class JovianTests: XCTestCase {
         var matching = RequestContext(
             method: "GET", target: "https://example.com/unavailable/api",
             head: HTTPHead(startLine: "GET /unavailable/api HTTP/1.1"))
-        runtime.modify(request: &matching)
+        try runtime.modify(request: &matching)
         XCTAssertEqual(matching.syntheticResponse?.statusCode, 503)
         XCTAssertEqual(matching.syntheticResponse?.reason, "Planned Outage")
         XCTAssertEqual(String(data: matching.syntheticResponse!.body, encoding: .utf8), "try later")
         var other = RequestContext(
             method: "GET", target: "https://example.com/healthy",
             head: HTTPHead(startLine: "GET /healthy HTTP/1.1"))
-        runtime.modify(request: &other)
+        try runtime.modify(request: &other)
         XCTAssertNil(other.syntheticResponse)
         XCTAssertEqual(runtime.trafficRates().upload, 2_000)
         XCTAssertEqual(runtime.trafficRates().download, 3_000)
@@ -408,24 +408,24 @@ final class JovianTests: XCTestCase {
         var local = RequestContext(
             method: "GET", target: "http://example.com/",
             head: HTTPHead(startLine: "GET / HTTP/1.1"), remoteAddress: "127.0.0.1")
-        runtime.modify(request: &local)
+        try runtime.modify(request: &local)
         XCTAssertEqual(local.syntheticResponse?.statusCode, 403)
         var remote = RequestContext(
             method: "GET", target: local.target,
             head: HTTPHead(startLine: "GET / HTTP/1.1"), remoteAddress: "10.0.0.1")
-        runtime.modify(request: &remote)
+        try runtime.modify(request: &remote)
         XCTAssertNil(remote.syntheticResponse)
         var ipv6 = RequestContext(
             method: "GET", target: local.target,
             head: HTTPHead(startLine: "GET / HTTP/1.1"), remoteAddress: "2001:db8::42")
-        runtime.modify(request: &ipv6)
+        try runtime.modify(request: &ipv6)
         XCTAssertEqual(ipv6.syntheticResponse?.statusCode, 403)
 
         var response = ResponseContext(
             requestMethod: "GET", target: local.target,
             head: HTTPHead(startLine: "HTTP/1.1 200 OK"),
             remoteAddress: "10.0.0.1")
-        runtime.modify(response: &response)
+        try runtime.modify(response: &response)
         XCTAssertEqual(response.head["Access-Control-Allow-Origin"], "https://client.example")
         XCTAssertEqual(response.head["Access-Control-Allow-Credentials"], "true")
         XCTAssertEqual(response.head["Access-Control-Max-Age"], "600")
@@ -710,7 +710,8 @@ final class JovianTests: XCTestCase {
             try MartianConfigurationParser.parse(
                 Data(#"{"status.Modifier":{"scope":["request"],"statusCode":200}}"#.utf8)))
         XCTAssertThrowsError(
-            try MartianConfigurationParser.parse(Data(#"{"fifo.Group":{"aggregateErrors":true,"modifiers":[]}}"#.utf8)))
+            try MartianConfigurationParser.parse(
+                Data(#"{"fifo.Group":{"aggregateErrors":"invalid","modifiers":[]}}"#.utf8)))
     }
 
     func testRuntimeStoresCanonicalMartianConfigurationForGET() throws {
@@ -722,7 +723,7 @@ final class JovianTests: XCTestCase {
         var request = RequestContext(
             method: "GET", target: "http://example.com/",
             head: HTTPHead(startLine: "GET / HTTP/1.1"))
-        runtime.modify(request: &request)
+        try runtime.modify(request: &request)
         XCTAssertEqual(request.head["X-Canonical"], "yes")
     }
 }

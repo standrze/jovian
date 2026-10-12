@@ -13,7 +13,8 @@ struct JovianCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "jovian",
         abstract: "Programmable Swift HTTP/HTTPS proxy.",
-        subcommands: [Serve.self, CertificateCommand.self])
+        version: "0.3.0",
+        subcommands: [Serve.self, CertificateCommand.self, CACommand.self, SessionsCommand.self])
 }
 
 struct Serve: ParsableCommand {
@@ -52,7 +53,9 @@ struct Serve: ParsableCommand {
     @Option(name: .customLong("download-bps"), help: "Download limit in bytes per second (greater than zero).")
     var downloadBPS: Int?
 
-    @Option(help: "Next HTTP or HTTPS proxy URL; optional credentials are percent encoded.")
+    @Option(
+        name: [.customLong("downstream-proxy-url"), .customLong("upstream-proxy")],
+        help: "HTTP, HTTPS, socks5, or socks5h next hop.")
     var downstreamProxyURL: String?
 
     @Option(help: "Request socket deadline in seconds; zero disables it.")
@@ -97,7 +100,67 @@ struct Serve: ParsableCommand {
     @Option(name: .customLong("response-header"), help: "Set a response header as NAME:VALUE; repeat for more headers.")
     var responseHeaders: [HeaderArgument] = []
 
+    @Option(help: "Username for the next-hop proxy only.")
+    var upstreamProxyUser: String?
+    @Option(help: "Environment variable containing the next-hop password.")
+    var upstreamProxyPasswordEnv: String?
+    @Option(help: "PEM CA for the HTTPS next hop only, independent of origin trust.")
+    var upstreamProxyCA: String?
+    @Option(help: "Persistent CA directory for interception.")
+    var interceptCA: String?
+    @Option(help: "CA directory for a dynamic TLS listener.")
+    var tlsCA: String?
+    @Option(help: "PEM TLS listener certificate chain.")
+    var tlsCert: String?
+    @Option(help: "PEM TLS listener private key.")
+    var tlsKey: String?
+    @Option(help: "TLS listen address; defaults to --host.")
+    var tlsHost: String?
+    @Option(help: "Fallback TLS certificate hostname; alias of --tls-server-name.")
+    var tlsDefaultHost: String?
+    @Option(help: "Drain duration in milliseconds; overrides --shutdown-grace.")
+    var shutdownGraceMS: Int?
+    @Flag(help: "Enable CORS for the local control API.")
+    var apiCORS = false
+    @Flag(help: "Retain bounded, redacted HAR bodies.")
+    var harBodies = false
+    @Option(help: "Maximum captured bytes per HAR body.")
+    var harBodyLimit = 65_536
+    @Option(help: "Total retained HAR body budget in bytes.")
+    var harBodyBudget = 32 * 1_024 * 1_024
+    @Option(name: .customLong("body-redact-field"), help: "Additional JSON/form field to redact; repeatable.")
+    var bodyRedactFields: [String] = []
+    @Option(help: "Session name or ID restricting this proxy to one origin.")
+    var session: String?
+    @Option(help: "Session storage directory.")
+    var sessionsDirectory: String?
+
     mutating func validate() throws {
+        if let shutdownGraceMS {
+            guard (0...300_000).contains(shutdownGraceMS) else {
+                throw ValidationError("--shutdown-grace-ms must be 0 through 300000")
+            }
+            shutdownGrace = Double(shutdownGraceMS) / 1_000
+        }
+        guard (1...4_194_304).contains(harBodyLimit), (1...268_435_456).contains(harBodyBudget) else {
+            throw ValidationError("invalid HAR body limit or budget")
+        }
+        guard (upstreamProxyUser == nil) == (upstreamProxyPasswordEnv == nil),
+            downstreamProxyURL != nil || (upstreamProxyUser == nil && upstreamProxyCA == nil)
+        else {
+            throw ValidationError(
+                "next-hop credentials and CA require --upstream-proxy; credentials require user and password environment variable"
+            )
+        }
+        guard (tlsCert == nil) == (tlsKey == nil), tlsCA == nil || tlsCert == nil,
+            tlsPort != nil || (tlsCA == nil && tlsCert == nil && tlsHost == nil && tlsDefaultHost == nil)
+        else {
+            throw ValidationError("TLS listener requires --tls-port and either a CA or matching --tls-cert/--tls-key")
+        }
+        guard interceptCA == nil || (!generateCACert && cert == nil) else {
+            throw ValidationError("choose one interception CA source")
+        }
+
         guard requestTimeout.isFinite, requestTimeout >= 0,
             connectTimeout.isFinite, connectTimeout > 0,
             shutdownGrace.isFinite, shutdownGrace >= 0
@@ -112,14 +175,19 @@ struct Serve: ParsableCommand {
         guard !generateCACert || cert == nil else {
             throw ValidationError("use --generate-ca-cert or --cert/--key, not both.")
         }
-        guard (tlsPort == nil && caOutput == nil) || generateCACert || cert != nil else {
+        guard
+            (tlsPort == nil && caOutput == nil) || generateCACert || cert != nil || interceptCA != nil
+                || (caOutput == nil && (tlsCA != nil || tlsCert != nil))
+        else {
             throw ValidationError("--tls-port and --ca-output require --generate-ca-cert or --cert/--key.")
         }
         if let downstreamProxyURL {
             guard let url = URL(string: downstreamProxyURL) else {
                 throw ValidationError("invalid downstream proxy URL")
             }
-            _ = try DownstreamProxy(url: url)
+            _ = try DownstreamProxy(
+                url: url, credentials: upstreamCredentials(),
+                certificateAuthority: upstreamProxyCA.map { URL(fileURLWithPath: $0) })
         }
         if let uploadBPS, uploadBPS <= 0 {
             throw ValidationError("--upload-bps must be greater than zero.")
@@ -138,6 +206,16 @@ struct Serve: ParsableCommand {
             throw ValidationError("environment variable \(proxyPasswordEnv) is not set")
         }
         return ProxyCredentials(username: proxyUser, password: password)
+    }
+
+    func upstreamCredentials(environment: [String: String] = ProcessInfo.processInfo.environment) throws
+        -> ProxyCredentials?
+    {
+        guard let upstreamProxyUser, let upstreamProxyPasswordEnv else { return nil }
+        guard let password = environment[upstreamProxyPasswordEnv] else {
+            throw ValidationError("next-hop password environment variable is not set")
+        }
+        return ProxyCredentials(username: upstreamProxyUser, password: password)
     }
 
     func run() throws {

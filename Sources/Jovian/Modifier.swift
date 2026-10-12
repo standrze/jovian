@@ -1,84 +1,94 @@
+import Darwin
 import Foundation
 
-#if canImport(Darwin)
-    import Darwin
-#else
-    import Glibc
-#endif
-
 /// A Swift equivalent of Martian's request/response modifier interfaces.
-///
-/// The proxy invokes these synchronous operations on workers, potentially for concurrent exchanges.
-/// Throwing aborts the current modifier chain; runtime configuration may suppress that error.
 public protocol Modifier: Sendable {
-    /// Modifies request metadata and any buffered body before forwarding.
     func modify(request: inout RequestContext) throws
-    /// Modifies response metadata and any buffered body before delivery.
     func modify(response: inout ResponseContext) throws
 }
 
 public extension Modifier {
-    /// Leaves requests unchanged when a modifier implements only response behavior.
     func modify(request: inout RequestContext) throws {}
-    /// Leaves responses unchanged when a modifier implements only request behavior.
     func modify(response: inout ResponseContext) throws {}
 }
 
-/// Applies a fixed sequence of modifiers in insertion order.
 public struct ModifierGroup: Modifier {
     public let modifiers: [any Modifier]
-    /// Retains the supplied modifiers in their execution order.
-    public init(_ modifiers: [any Modifier]) { self.modifiers = modifiers }
+    public let aggregateErrors: Bool
 
-    /// Applies request modifiers in order, stopping at the first thrown error.
-    public func modify(request: inout RequestContext) throws {
-        for modifier in modifiers { try modifier.modify(request: &request) }
+    public init(_ modifiers: [any Modifier], aggregateErrors: Bool = false) {
+        self.modifiers = modifiers
+        self.aggregateErrors = aggregateErrors
     }
 
-    /// Applies response modifiers in order, stopping at the first thrown error.
+    public func modify(request: inout RequestContext) throws {
+        var errors: [any Error] = []
+        for modifier in modifiers {
+            do { try modifier.modify(request: &request) } catch {
+                guard aggregateErrors else { throw error }
+                errors.append(error)
+            }
+        }
+        if !errors.isEmpty { throw ModifierErrors(errors) }
+    }
+
     public func modify(response: inout ResponseContext) throws {
-        for modifier in modifiers { try modifier.modify(response: &response) }
+        var errors: [any Error] = []
+        for modifier in modifiers {
+            do { try modifier.modify(response: &response) } catch {
+                guard aggregateErrors else { throw error }
+                errors.append(error)
+            }
+        }
+        if !errors.isEmpty { throw ModifierErrors(errors) }
     }
 }
 
-/// Replaces all matching headers with one value in the selected directions.
+/// Errors in execution order, including errors from nested modifier groups.
+public struct ModifierErrors: Error, CustomStringConvertible {
+    public let errors: [any Error]
+
+    public init(_ errors: [any Error]) { self.errors = errors }
+
+    public var description: String {
+        errors.map { String(describing: $0) }.joined(separator: "; ")
+    }
+}
+
 public struct HeaderModifier: Modifier {
-    /// Selects the request, response, or both modification directions.
     public enum Scope: Sendable { case request, response, both }
     public let scope: Scope
     public let name: String
     public let value: String
 
-    /// Creates a header replacement; invalid header names or values are ignored when applied.
     public init(scope: Scope, name: String, value: String) {
         self.scope = scope
         self.name = name
         self.value = value
     }
 
-    /// Replaces the request header when the configured scope includes requests.
-    public func modify(request: inout RequestContext) {
-        if scope == .request || scope == .both { request.head[name] = value }
+    public func modify(request: inout RequestContext) throws {
+        if scope == .request || scope == .both {
+            try MessageHeaders.set(name, value: value, head: &request.head, response: false)
+        }
     }
 
-    /// Replaces the response header when the configured scope includes responses.
-    public func modify(response: inout ResponseContext) {
-        if scope == .response || scope == .both { response.head[name] = value }
+    public func modify(response: inout ResponseContext) throws {
+        if scope == .response || scope == .both {
+            try MessageHeaders.set(name, value: value, head: &response.head, response: true)
+        }
     }
 }
 
-/// Runs a nested modifier when the request target matches a host, ignoring case.
 public struct HostFilter: Modifier {
     public let host: String
     public let modifier: any Modifier
 
-    /// Creates an exact host filter around the supplied modifier.
     public init(host: String, modifier: any Modifier) {
         self.host = host
         self.modifier = modifier
     }
 
-    /// Matches the target host, falling back to the Host header, before modifying the request.
     public func modify(request: inout RequestContext) throws {
         let requestHost =
             URL(string: request.target)?.host ?? request.head["Host"]?.split(separator: ":").first.map(String.init)
@@ -87,7 +97,6 @@ public struct HostFilter: Modifier {
         }
     }
 
-    /// Matches the original target host before modifying the response.
     public func modify(response: inout ResponseContext) throws {
         if URL(string: response.target)?.host?.caseInsensitiveCompare(host) == .orderedSame {
             try modifier.modify(response: &response)
@@ -95,47 +104,39 @@ public struct HostFilter: Modifier {
     }
 }
 
-/// Runs a nested modifier for selected HTTP methods, ignoring case.
 public struct MethodFilter: Modifier {
     public let methods: Set<String>
     public let modifier: any Modifier
 
-    /// Normalizes method names to uppercase and retains the nested modifier.
     public init(methods: [String], modifier: any Modifier) {
         self.methods = Set(methods.map { $0.uppercased() })
         self.modifier = modifier
     }
 
-    /// Modifies requests whose method belongs to the configured set.
     public func modify(request: inout RequestContext) throws {
         if methods.contains(request.method.uppercased()) { try modifier.modify(request: &request) }
     }
 
-    /// Modifies responses whose associated request method belongs to the configured set.
     public func modify(response: inout ResponseContext) throws {
         if methods.contains(response.requestMethod.uppercased()) { try modifier.modify(response: &response) }
     }
 }
 
-/// Runs a nested modifier when all supplied host and path-prefix conditions match.
 public struct URLFilter: Modifier {
     public let host: String?
     public let pathPrefix: String?
     public let modifier: any Modifier
 
-    /// Creates a filter; omitted host or path conditions impose no restriction.
     public init(host: String? = nil, pathPrefix: String? = nil, modifier: any Modifier) {
         self.host = host
         self.pathPrefix = pathPrefix
         self.modifier = modifier
     }
 
-    /// Modifies a request if its target URL satisfies the configured conditions.
     public func modify(request: inout RequestContext) throws {
         if matches(request.target) { try modifier.modify(request: &request) }
     }
 
-    /// Modifies a response if the associated target URL satisfies the configured conditions.
     public func modify(response: inout ResponseContext) throws {
         if matches(response.target) { try modifier.modify(response: &response) }
     }
@@ -148,18 +149,15 @@ public struct URLFilter: Modifier {
     }
 }
 
-/// Replaces the HTTP response status and reason phrase.
 public struct StatusModifier: Modifier {
     public let statusCode: Int
     public let reason: String
 
-    /// Uses the supplied reason or a built-in phrase; wire serialization validates the status.
     public init(statusCode: Int, reason: String? = nil) {
         self.statusCode = statusCode
         self.reason = reason ?? Self.defaultReason(statusCode)
     }
 
-    /// Replaces the status line while preserving its HTTP version.
     public func modify(response: inout ResponseContext) {
         let version = response.head.startLine.split(separator: " ").first.map(String.init) ?? "HTTP/1.1"
         response.head.startLine = "\(version) \(statusCode) \(reason)"
@@ -170,6 +168,7 @@ public struct StatusModifier: Modifier {
         case 200: "OK"
         case 201: "Created"
         case 204: "No Content"
+        case 206: "Partial Content"
         case 301: "Moved Permanently"
         case 302: "Found"
         case 304: "Not Modified"
@@ -177,6 +176,9 @@ public struct StatusModifier: Modifier {
         case 401: "Unauthorized"
         case 403: "Forbidden"
         case 404: "Not Found"
+        case 405: "Method Not Allowed"
+        case 413: "Content Too Large"
+        case 416: "Range Not Satisfiable"
         case 429: "Too Many Requests"
         case 500: "Internal Server Error"
         case 502: "Bad Gateway"
@@ -186,27 +188,20 @@ public struct StatusModifier: Modifier {
     }
 }
 
-/// Blocks the calling worker thread for a configured duration.
-///
-/// Do not invoke this modifier from a NIO event loop.
 public struct DelayModifier: Modifier {
-    /// Selects the request, response, or both modification directions.
     public enum Scope: Sendable { case request, response, both }
     public let scope: Scope
     public let milliseconds: Int
 
-    /// Creates a delay in milliseconds; callers must supply a nonnegative duration.
     public init(scope: Scope, milliseconds: Int) {
         self.scope = scope
         self.milliseconds = milliseconds
     }
 
-    /// Sleeps on the calling thread when the scope includes requests.
     public func modify(request: inout RequestContext) {
         if scope == .request || scope == .both { pause() }
     }
 
-    /// Sleeps on the calling thread when the scope includes responses.
     public func modify(response: inout ResponseContext) {
         if scope == .response || scope == .both { pause() }
     }
@@ -214,18 +209,15 @@ public struct DelayModifier: Modifier {
     private func pause() { Thread.sleep(forTimeInterval: Double(milliseconds) / 1_000) }
 }
 
-/// Replaces or removes a named query item in the request target.
 public struct QueryStringModifier: Modifier {
     public let name: String
     public let value: String?
 
-    /// Uses `nil` to remove matching query items, otherwise replacing them with one value.
     public init(name: String, value: String?) {
         self.name = name
         self.value = value
     }
 
-    /// Rewrites the query when the target can be parsed as URL components.
     public func modify(request: inout RequestContext) {
         guard var components = URLComponents(string: request.target) else { return }
         var items = components.queryItems ?? []
@@ -236,22 +228,18 @@ public struct QueryStringModifier: Modifier {
     }
 }
 
-/// Replaces or removes a cookie in the selected request and response directions.
 public struct CookieModifier: Modifier {
-    /// Selects the request, response, or both modification directions.
     public enum Scope: Sendable { case request, response, both }
     public let scope: Scope
     public let name: String
     public let value: String?
 
-    /// Uses `nil` to remove the named cookie; name comparisons ignore case.
     public init(scope: Scope, name: String, value: String?) {
         self.scope = scope
         self.name = name
         self.value = value
     }
 
-    /// Updates Cookie fields while preserving unrelated cookie pairs.
     public func modify(request: inout RequestContext) {
         guard scope == .request || scope == .both else { return }
         var pairs = request.head.values(for: "Cookie")
@@ -264,7 +252,6 @@ public struct CookieModifier: Modifier {
         request.head.replaceValues(for: "Cookie", with: pairs.isEmpty ? [] : [pairs.joined(separator: "; ")])
     }
 
-    /// Updates Set-Cookie fields while retaining attributes of matching cookies.
     public func modify(response: inout ResponseContext) {
         guard scope == .response || scope == .both else { return }
         var found = false
@@ -286,50 +273,44 @@ public struct CookieModifier: Modifier {
     }
 }
 
-/// Replaces complete buffered bodies in the selected directions.
-///
-/// Streamed bodies represented by `nil` remain unchanged.
 public struct BodyModifier: Modifier {
-    /// Selects the request, response, or both modification directions.
     public enum Scope: Sendable { case request, response, both }
     public let scope: Scope
     public let content: Data
     public let contentType: String?
 
-    /// Retains replacement bytes and an optional Content-Type value.
     public init(scope: Scope, content: Data, contentType: String? = nil) {
         self.scope = scope
         self.content = content
         self.contentType = contentType
     }
 
-    /// Replaces a buffered request body and removes its previous Content-Encoding.
     public func modify(request: inout RequestContext) {
-        guard scope == .request || scope == .both, request.body != nil else { return }
+        guard scope == .request || scope == .both else { return }
         request.body = content
+        request.head.modifierContentLength = Int64(content.count)
+        request.head["Content-Length"] = String(content.count)
+        request.head.remove("Transfer-Encoding")
         request.head.remove("Content-Encoding")
         if let contentType { request.head["Content-Type"] = contentType }
     }
 
-    /// Replaces a buffered response body and removes its previous Content-Encoding.
     public func modify(response: inout ResponseContext) {
-        guard scope == .response || scope == .both, response.requestMethod != "HEAD",
-            response.body != nil
-        else { return }
-        response.body = content
-        response.head.remove("Content-Encoding")
-        if let contentType { response.head["Content-Type"] = contentType }
+        guard scope == .response || scope == .both else { return }
+        let plan = ByteRangePlan(
+            size: content.count, range: response.requestHead?["Range"],
+            contentType: contentType ?? response.head["Content-Type"] ?? "application/octet-stream")
+        plan.apply(to: &response, changeFullStatus: false)
+        response.body = plan.data(from: content)
     }
 }
 
-/// Replaces the upstream exchange with a synthetic response.
 public struct FailureModifier: Modifier {
     public let statusCode: Int
     public let reason: String
     public let body: Data
     public let contentType: String
 
-    /// Creates the local response returned when this modifier runs.
     public init(
         statusCode: Int = 503, reason: String = "Service Unavailable",
         body: Data = Data(), contentType: String = "text/plain; charset=utf-8"
@@ -340,7 +321,6 @@ public struct FailureModifier: Modifier {
         self.contentType = contentType
     }
 
-    /// Sets the synthetic response that the proxy will send without contacting the upstream.
     public func modify(request: inout RequestContext) {
         request.syntheticResponse = SyntheticResponse(
             statusCode: statusCode, reason: reason,
@@ -348,23 +328,19 @@ public struct FailureModifier: Modifier {
     }
 }
 
-/// Runs a nested modifier when the downstream client IP belongs to a configured network.
 public struct IPFilter: Modifier {
     private let networks: [IPNetwork]
     public let modifier: any Modifier
 
-    /// Parses IPv4 or IPv6 addresses and CIDR ranges, throwing for invalid notation or prefixes.
     public init(networks: [String], modifier: any Modifier) throws {
         self.networks = try networks.map(IPNetwork.init)
         self.modifier = modifier
     }
 
-    /// Modifies requests from matching client addresses; absent addresses do not match.
     public func modify(request: inout RequestContext) throws {
         if matches(request.remoteAddress) { try modifier.modify(request: &request) }
     }
 
-    /// Modifies responses associated with matching client addresses.
     public func modify(response: inout ResponseContext) throws {
         if matches(response.remoteAddress) { try modifier.modify(response: &response) }
     }
@@ -416,7 +392,6 @@ private struct IPNetwork: Sendable {
     }
 }
 
-/// Sets configured CORS response headers; it does not synthesize preflight responses.
 public struct CORSModifier: Modifier {
     public let allowOrigin: String
     public let allowMethods: [String]
@@ -425,7 +400,6 @@ public struct CORSModifier: Modifier {
     public let allowCredentials: Bool
     public let maxAge: Int?
 
-    /// Creates CORS response settings; `maxAge` is a duration in seconds.
     public init(
         allowOrigin: String, allowMethods: [String] = [], allowHeaders: [String] = [],
         exposeHeaders: [String] = [], allowCredentials: Bool = false, maxAge: Int? = nil
@@ -438,7 +412,6 @@ public struct CORSModifier: Modifier {
         self.maxAge = maxAge
     }
 
-    /// Writes configured CORS headers, setting Vary to Origin for a non-wildcard origin.
     public func modify(response: inout ResponseContext) {
         response.head["Access-Control-Allow-Origin"] = allowOrigin
         if !allowMethods.isEmpty {

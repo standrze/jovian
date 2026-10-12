@@ -1,33 +1,57 @@
 import DequeModule
 import Foundation
 
-/// An in-memory, bounded traffic history exported as HAR 1.2 metadata.
+/// Bounded HAR history.
 ///
-/// The lock protects every access to the entry deque. Encoding uses an independent snapshot.
+/// Body retention is disabled unless a capture policy is supplied.
 public final class HARStore: TrafficLogger, @unchecked Sendable {
     private let lock = NSLock()
     private let maximumEntries: Int
+    private let capturePolicy: BodyCapturePolicy?
+    private let maximumRetainedBodyBytes: Int
+    private var retainedBodyBytes = 0
     private var entries: Deque<TrafficEntry> = []
 
-    /// Creates an empty history, retaining at least one entry even for a nonpositive limit.
-    public init(maximumEntries: Int = 10_000) { self.maximumEntries = max(1, maximumEntries) }
+    public init(
+        maximumEntries: Int = 10_000, capturePolicy: BodyCapturePolicy? = nil,
+        maximumRetainedBodyBytes: Int = 32 * 1_024 * 1_024
+    ) {
+        self.maximumEntries = max(1, maximumEntries)
+        self.capturePolicy = capturePolicy
+        self.maximumRetainedBodyBytes = max(0, maximumRetainedBodyBytes)
+    }
 
-    /// Appends an entry and discards the oldest entries when the capacity is exceeded.
     public func record(_ entry: TrafficEntry) {
+        let request = capturePolicy?.capture(
+            entry.requestBody, headers: entry.requestHeaders,
+            truncated: entry.requestBodyTruncated)
+        let response = capturePolicy?.capture(
+            entry.responseBody, headers: entry.responseHeaders,
+            truncated: entry.responseBodyTruncated)
+        let retained = TrafficEntry(
+            timestamp: entry.timestamp, method: entry.method, target: entry.target, status: entry.status,
+            bytes: entry.bytes, durationMilliseconds: entry.durationMilliseconds, transport: entry.transport,
+            error: entry.error, requestHeaders: entry.requestHeaders, responseHeaders: entry.responseHeaders,
+            requestBody: request?.data, responseBody: response?.data,
+            requestBodyTruncated: request?.truncated ?? entry.requestBodyTruncated,
+            responseBodyTruncated: response?.truncated ?? entry.responseBodyTruncated)
         lock.withLock {
-            entries.append(entry)
-            if entries.count > maximumEntries { entries.removeFirst(entries.count - maximumEntries) }
+            entries.append(retained)
+            retainedBodyBytes += Self.bodyBytes(retained)
+            while entries.count > maximumEntries || retainedBodyBytes > maximumRetainedBodyBytes {
+                retainedBodyBytes -= Self.bodyBytes(entries.removeFirst())
+            }
         }
     }
 
-    /// Removes all retained traffic entries.
-    public func reset() { lock.withLock { entries.removeAll(keepingCapacity: true) } }
-    /// Returns the number of currently retained entries.
+    public func reset() {
+        lock.withLock {
+            entries.removeAll(keepingCapacity: true)
+            retainedBodyBytes = 0
+        }
+    }
     public func count() -> Int { lock.withLock { entries.count } }
 
-    /// Encodes a snapshot of traffic metadata; bodies and parsed cookies are not included.
-    ///
-    /// Throws if the generated document cannot be serialized as JSON.
     public func encodedHAR() throws -> Data {
         let snapshot = lock.withLock { entries }
         let harEntries: [[String: Any]] = snapshot.map { entry in
@@ -35,47 +59,59 @@ public final class HARStore: TrafficLogger, @unchecked Sendable {
                 URLComponents(string: entry.target)?.queryItems?.map {
                     ["name": $0.name, "value": $0.value ?? ""]
                 } ?? []
-            let requestHeaderSize = Self.headerSize(entry.requestHeaders)
-            let responseHeaderSize = Self.headerSize(entry.responseHeaders)
-            let mimeType =
-                entry.responseHeaders.first {
-                    $0.name.caseInsensitiveCompare("Content-Type") == .orderedSame
-                }?.value ?? "application/octet-stream"
+            var request: [String: Any] = [
+                "method": entry.method, "url": entry.target, "httpVersion": "HTTP/1.1",
+                "headers": entry.requestHeaders.map { ["name": $0.name, "value": $0.value] },
+                "queryString": queryItems, "cookies": [],
+                "headersSize": Self.headerSize(entry.requestHeaders), "bodySize": -1,
+            ]
+            if let body = entry.requestBody {
+                var postData: [String: Any] = [
+                    "mimeType": Self.mimeType(entry.requestHeaders),
+                    "_truncated": entry.requestBodyTruncated,
+                ]
+                if let text = String(data: body, encoding: .utf8) {
+                    postData["text"] = text
+                } else {
+                    postData["text"] = body.base64EncodedString()
+                    postData["_encoding"] = "base64"
+                }
+                request["postData"] = postData
+            }
+            var content: [String: Any] = ["size": entry.bytes, "mimeType": Self.mimeType(entry.responseHeaders)]
+            if let body = entry.responseBody {
+                content["text"] = body.base64EncodedString()
+                content["encoding"] = "base64"
+                content["_truncated"] = entry.responseBodyTruncated
+            }
             return [
                 "startedDateTime": ISO8601DateFormatter().string(from: entry.timestamp),
-                "time": entry.durationMilliseconds,
-                "request": [
-                    "method": entry.method,
-                    "url": entry.target,
-                    "httpVersion": "HTTP/1.1",
-                    "headers": entry.requestHeaders.map { ["name": $0.name, "value": $0.value] },
-                    "queryString": queryItems, "cookies": [],
-                    "headersSize": requestHeaderSize, "bodySize": -1,
-                ],
+                "time": entry.durationMilliseconds, "request": request,
                 "response": [
-                    "status": entry.status,
-                    "statusText": entry.error ?? "",
-                    "httpVersion": "HTTP/1.1",
+                    "status": entry.status, "statusText": entry.error ?? "", "httpVersion": "HTTP/1.1",
                     "headers": entry.responseHeaders.map { ["name": $0.name, "value": $0.value] },
-                    "cookies": [],
-                    "content": ["size": entry.bytes, "mimeType": mimeType],
-                    "redirectURL": "", "headersSize": responseHeaderSize, "bodySize": entry.bytes,
+                    "cookies": [], "content": content, "redirectURL": "",
+                    "headersSize": Self.headerSize(entry.responseHeaders), "bodySize": entry.bytes,
                 ],
-                "cache": [:],
-                "timings": ["send": 0, "wait": entry.durationMilliseconds, "receive": 0],
+                "cache": [:], "timings": ["send": 0, "wait": entry.durationMilliseconds, "receive": 0],
                 "comment": entry.transport,
             ]
         }
-        let root: [String: Any] = [
-            "log": [
-                "version": "1.2",
-                "creator": ["name": "jovian", "version": "0.2.0"],
-                "entries": harEntries,
-            ]
-        ]
-        return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys, .prettyPrinted])
+        return try JSONSerialization.data(
+            withJSONObject: [
+                "log": [
+                    "version": "1.2", "creator": ["name": "jovian", "version": "0.3.0"], "entries": harEntries,
+                ]
+            ], options: [.sortedKeys])
     }
 
+    private static func bodyBytes(_ entry: TrafficEntry) -> Int {
+        (entry.requestBody?.count ?? 0) + (entry.responseBody?.count ?? 0)
+    }
+    private static func mimeType(_ headers: [LoggedHeader]) -> String {
+        headers.first { $0.name.caseInsensitiveCompare("Content-Type") == .orderedSame }?.value
+            ?? "application/octet-stream"
+    }
     private static func headerSize(_ headers: [LoggedHeader]) -> Int {
         headers.reduce(2) { $0 + $1.name.utf8.count + $1.value.utf8.count + 4 }
     }

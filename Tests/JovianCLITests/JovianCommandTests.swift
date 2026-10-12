@@ -85,7 +85,7 @@ import Testing
         ["--shutdown-grace", "infinity"], ["--proxy-name", "invalid name"],
         ["--generate-ca-cert", "--cert", "cert.pem", "--key", "key.pem"],
         ["--cert", "cert.pem"], ["--key", "key.pem"], ["--tls-port", "4443"],
-        ["--ca-output", "authority.pem"], ["--downstream-proxy-url", "socks5://localhost:1080"],
+        ["--ca-output", "authority.pem"], ["--downstream-proxy-url", "socks4://localhost:1080"],
         ["--downstream-proxy-url", "http://localhost/private/path"],
     ] {
         #expect(throws: (any Error).self) { try Serve.parse(arguments) }

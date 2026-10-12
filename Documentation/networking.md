@@ -26,14 +26,16 @@ NIO request and response heads are converted at the application boundary.
 - Writes await NIO completion before the next chunk. Traffic pacing suspends the
   transfer task using `ContinuousClock`; it does not sleep on event-loop threads.
   Pacing applies to payload bytes, not HTTP header or chunk-framing overhead.
-- Body modifiers receive complete bodies up to the configured cap (4 MiB by
-  default). Larger bodies stream with `body == nil`; collecting an unknown-sized
+  Runtime traffic-shape defaults share budgets across transfers; URL actions use
+  decoded response offsets. Opaque tunnels use only the shared defaults.
+- Body inspection receives complete bodies up to the configured cap (4 MiB by
+  default). Larger bodies stream with `body == nil`; explicit body replacement still works; collecting an unknown-sized
   body can temporarily retain the cap plus one 16 KiB read. Chunked responses
   stream immediately so long-running responses are not held until completion.
 - Traffic-entry body snapshots stay capped. JSON Lines can include those
-  snapshots; HAR serialization omits bodies. Opaque tunnels retain metadata and
+  snapshots; HAR serialization omits bodies by default; `--har-bodies` enables bounded, field-redacted retention. Opaque tunnels retain metadata and
   byte counts. Explicit TLS interception decodes HTTP into the same bounded pipeline.
-- Admin bodies are limited to 1 MiB, including decoded chunked input. The admin
+- Admin bodies are limited to 1 MiB, requiring Content-Length and rejecting chunked input. The admin
   listener remains loopback by default; no new authentication policy was added.
 
 ## connections and protocol handoff
@@ -126,3 +128,16 @@ encoding. Raw socket code exists only in test fixtures, as an independent peer.
 The migration has been exercised on macOS. Platform imports and the retained
 test peer have Darwin/Glibc branches, but Linux support is not claimed without
 running these checks on Linux. No live third-party targets are used.
+
+## Consolidated trust and shutdown
+
+SOCKS5 negotiation uses the same NIO channel and deadline as HTTP/HTTPS next
+hops. Both SOCKS URL spellings resolve hostnames remotely. Separate next-hop
+credentials and optional PEM/DER roots stay out of origin requests and logs.
+`--upstream-proxy-ca` overrides only next-hop trust; the legacy upstream TLS
+policy remains the fallback when that option is absent.
+
+TLS close-notify waits are bounded to 100 milliseconds in client and server
+contexts, including dynamically issued listener identities. Application data
+still follows the normal request drain; this bound applies to TLS teardown
+when a peer does not complete its close handshake.

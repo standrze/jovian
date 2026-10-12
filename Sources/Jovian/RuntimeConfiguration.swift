@@ -1,20 +1,15 @@
 import Foundation
 
-/// A case-insensitive header-name expectation with an optional exact value match.
 public struct HeaderExpectation: Codable, Sendable {
     public var name: String
     public var value: String?
 
-    /// Uses `nil` to require only that the named header is present.
     public init(name: String, value: String? = nil) {
         self.name = name
         self.value = value
     }
 }
 
-/// Codable runtime rules, verification expectations, and per-direction byte rates.
-///
-/// `RuntimeConfiguration.replace(with:)` validates and normalizes omitted fields.
 public struct RuntimeConfigurationDocument: Codable, Sendable {
     public var requestHeaders: [String: String]?
     public var responseHeaders: [String: String]?
@@ -25,7 +20,6 @@ public struct RuntimeConfigurationDocument: Codable, Sendable {
     public var verifyRequestHeaders: [String: [HeaderExpectation]]?
     public var verifyResponseHeaders: [String: [HeaderExpectation]]?
 
-    /// Creates a configuration document; omitted rates mean no runtime rate override.
     public init(
         requestHeaders: [String: String]? = nil,
         responseHeaders: [String: String]? = nil,
@@ -50,7 +44,17 @@ public struct RuntimeConfigurationDocument: Codable, Sendable {
 /// JSON representation of the composable Martian-style modifier tree.
 public indirect enum ModifierSpec: Codable, Sendable {
     case header(scope: [String], name: String, value: String)
+    case headerAppend(scope: [String], name: String, value: String)
+    case headerBlacklist(scope: [String], names: [String])
+    case headerCopy(scope: [String], from: String, to: String)
+    case headerID(echoResponse: Bool)
     case group(modifiers: [ModifierSpec])
+    case match(scope: [String], condition: MatchCondition, modifier: ModifierSpec, elseModifier: ModifierSpec?)
+    case url(scheme: String?, host: String?, path: String?, query: String?)
+    case port(port: Int?, defaultForScheme: Bool, remove: Bool)
+    case verify(scope: [String]?, expectation: VerificationSpec)
+    case staticFiles(rootPath: String, explicitPaths: [String: String])
+    case skipRoundTrip
     case hostFilter(host: String, modifier: ModifierSpec)
     case methodFilter(methods: [String], modifier: ModifierSpec)
     case urlFilter(host: String?, pathPrefix: String?, modifier: ModifierSpec)
@@ -69,13 +73,16 @@ public indirect enum ModifierSpec: Codable, Sendable {
         case type, scope, name, value, modifiers, host, modifier, methods, pathPrefix
         case statusCode, reason, milliseconds, content, contentType, networks
         case allowOrigin, allowMethods, allowHeaders, exposeHeaders, allowCredentials, maxAge
+        case condition, path, query, scheme, port, defaultForScheme, remove
+        case expectation, rootPath, explicitPaths, names, from, to, echoResponse
+        case elseModifier = "else"
     }
     private enum Kind: String, Codable {
         case header, group, hostFilter, methodFilter, urlFilter, status, delay, queryString, cookie, body
-        case failure, ipFilter, cors
+        case failure, ipFilter, cors, headerAppend, headerBlacklist, headerCopy, headerID
+        case match, url, port, verify, staticFiles, skipRoundTrip
     }
 
-    /// Decodes the Jovian modifier representation, rejecting unknown kinds or malformed fields.
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: Keys.self)
         switch try values.decode(Kind.self, forKey: .type) {
@@ -84,8 +91,52 @@ public indirect enum ModifierSpec: Codable, Sendable {
                 scope: try values.decode([String].self, forKey: .scope),
                 name: try values.decode(String.self, forKey: .name),
                 value: try values.decode(String.self, forKey: .value))
+        case .headerAppend:
+            self = .headerAppend(
+                scope: try values.decodeIfPresent([String].self, forKey: .scope) ?? ["request", "response"],
+                name: try values.decode(String.self, forKey: .name),
+                value: try values.decode(String.self, forKey: .value))
+        case .headerBlacklist:
+            self = .headerBlacklist(
+                scope: try values.decodeIfPresent([String].self, forKey: .scope) ?? ["request", "response"],
+                names: try values.decode([String].self, forKey: .names))
+        case .headerCopy:
+            self = .headerCopy(
+                scope: try values.decodeIfPresent([String].self, forKey: .scope) ?? ["request", "response"],
+                from: try values.decode(String.self, forKey: .from),
+                to: try values.decode(String.self, forKey: .to))
+        case .headerID:
+            self = .headerID(echoResponse: try values.decodeIfPresent(Bool.self, forKey: .echoResponse) ?? false)
         case .group:
             self = .group(modifiers: try values.decode([ModifierSpec].self, forKey: .modifiers))
+        case .match:
+            self = .match(
+                scope: try values.decodeIfPresent([String].self, forKey: .scope) ?? ["request", "response"],
+                condition: try values.decode(MatchCondition.self, forKey: .condition),
+                modifier: try values.decode(ModifierSpec.self, forKey: .modifier),
+                elseModifier: try values.decodeIfPresent(ModifierSpec.self, forKey: .elseModifier))
+        case .url:
+            self = .url(
+                scheme: try values.decodeIfPresent(String.self, forKey: .scheme),
+                host: try values.decodeIfPresent(String.self, forKey: .host),
+                path: try values.decodeIfPresent(String.self, forKey: .path),
+                query: try values.decodeIfPresent(String.self, forKey: .query))
+        case .port:
+            self = .port(
+                port: try values.decodeIfPresent(Int.self, forKey: .port),
+                defaultForScheme: try values.decodeIfPresent(Bool.self, forKey: .defaultForScheme) ?? false,
+                remove: try values.decodeIfPresent(Bool.self, forKey: .remove) ?? false)
+        case .verify:
+            self = .verify(
+                scope: try values.decodeIfPresent([String].self, forKey: .scope),
+                expectation: try values.decode(VerificationSpec.self, forKey: .expectation))
+        case .staticFiles:
+            self = .staticFiles(
+                rootPath: try values.decode(String.self, forKey: .rootPath),
+                explicitPaths: try values.decodeIfPresent(
+                    [String: String].self, forKey: .explicitPaths) ?? [:])
+        case .skipRoundTrip:
+            self = .skipRoundTrip
         case .hostFilter:
             self = .hostFilter(
                 host: try values.decode(String.self, forKey: .host),
@@ -142,7 +193,6 @@ public indirect enum ModifierSpec: Codable, Sendable {
         }
     }
 
-    /// Encodes the modifier tree using Jovian's tagged JSON representation.
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: Keys.self)
         switch self {
@@ -151,9 +201,53 @@ public indirect enum ModifierSpec: Codable, Sendable {
             try values.encode(scope, forKey: .scope)
             try values.encode(name, forKey: .name)
             try values.encode(value, forKey: .value)
+        case .headerAppend(let scope, let name, let value):
+            try values.encode(Kind.headerAppend, forKey: .type)
+            try values.encode(scope, forKey: .scope)
+            try values.encode(name, forKey: .name)
+            try values.encode(value, forKey: .value)
+        case .headerBlacklist(let scope, let names):
+            try values.encode(Kind.headerBlacklist, forKey: .type)
+            try values.encode(scope, forKey: .scope)
+            try values.encode(names, forKey: .names)
+        case .headerCopy(let scope, let from, let to):
+            try values.encode(Kind.headerCopy, forKey: .type)
+            try values.encode(scope, forKey: .scope)
+            try values.encode(from, forKey: .from)
+            try values.encode(to, forKey: .to)
+        case .headerID(let echoResponse):
+            try values.encode(Kind.headerID, forKey: .type)
+            try values.encode(echoResponse, forKey: .echoResponse)
         case .group(let modifiers):
             try values.encode(Kind.group, forKey: .type)
             try values.encode(modifiers, forKey: .modifiers)
+        case .match(let scope, let condition, let modifier, let elseModifier):
+            try values.encode(Kind.match, forKey: .type)
+            try values.encode(scope, forKey: .scope)
+            try values.encode(condition, forKey: .condition)
+            try values.encode(modifier, forKey: .modifier)
+            try values.encodeIfPresent(elseModifier, forKey: .elseModifier)
+        case .url(let scheme, let host, let path, let query):
+            try values.encode(Kind.url, forKey: .type)
+            try values.encodeIfPresent(scheme, forKey: .scheme)
+            try values.encodeIfPresent(host, forKey: .host)
+            try values.encodeIfPresent(path, forKey: .path)
+            try values.encodeIfPresent(query, forKey: .query)
+        case .port(let port, let defaultForScheme, let remove):
+            try values.encode(Kind.port, forKey: .type)
+            try values.encodeIfPresent(port, forKey: .port)
+            try values.encode(defaultForScheme, forKey: .defaultForScheme)
+            try values.encode(remove, forKey: .remove)
+        case .verify(let scope, let expectation):
+            try values.encode(Kind.verify, forKey: .type)
+            try values.encodeIfPresent(scope, forKey: .scope)
+            try values.encode(expectation, forKey: .expectation)
+        case .staticFiles(let rootPath, let explicitPaths):
+            try values.encode(Kind.staticFiles, forKey: .type)
+            try values.encode(rootPath, forKey: .rootPath)
+            try values.encode(explicitPaths, forKey: .explicitPaths)
+        case .skipRoundTrip:
+            try values.encode(Kind.skipRoundTrip, forKey: .type)
         case .hostFilter(let host, let modifier):
             try values.encode(Kind.hostFilter, forKey: .type)
             try values.encode(host, forKey: .host)
@@ -212,7 +306,7 @@ public indirect enum ModifierSpec: Codable, Sendable {
         }
     }
 
-    func compile() throws -> any Modifier {
+    func compile(verifications: VerificationStore = VerificationStore()) throws -> any Modifier {
         switch self {
         case .header(let scopeNames, let name, let value):
             let normalized = Set(scopeNames.map { $0.lowercased() })
@@ -222,16 +316,39 @@ public indirect enum ModifierSpec: Codable, Sendable {
             let scope: HeaderModifier.Scope =
                 normalized.count == 2 ? .both : (normalized.contains("request") ? .request : .response)
             return HeaderModifier(scope: scope, name: name, value: value)
+        case .headerAppend(let scope, let name, let value):
+            return try HeaderOperationModifier(.append(name: name, value: value), scope: scope)
+        case .headerBlacklist(let scope, let names):
+            return try HeaderOperationModifier(.blacklist(names: names), scope: scope)
+        case .headerCopy(let scope, let from, let to):
+            return try HeaderOperationModifier(.copy(from: from, to: to), scope: scope)
+        case .headerID(let echoResponse):
+            return HeaderIDModifier(echoResponse: echoResponse)
         case .group(let specs):
-            return ModifierGroup(try specs.map { try $0.compile() })
+            return ModifierGroup(try specs.map { try $0.compile(verifications: verifications) })
+        case .match(let scope, let condition, let child, let other):
+            return try MatchModifier(
+                condition: condition, scope: scope,
+                modifier: child.compile(verifications: verifications),
+                elseModifier: other?.compile(verifications: verifications))
+        case .url(let scheme, let host, let path, let query):
+            return try URLRewriteModifier(scheme: scheme, host: host, path: path, query: query)
+        case .port(let port, let defaultForScheme, let remove):
+            return try PortRewriteModifier(port: port, defaultForScheme: defaultForScheme, remove: remove)
+        case .verify(let scope, let expectation):
+            return try VerifierModifier(spec: expectation, scope: scope, store: verifications)
+        case .staticFiles(let rootPath, let explicitPaths):
+            return try StaticFileModifier(rootPath: rootPath, explicitPaths: explicitPaths)
+        case .skipRoundTrip:
+            return SkipRoundTripModifier()
         case .hostFilter(let host, let child):
             guard !host.isEmpty else { throw ProxyError.invalidHTTP("host filter host cannot be empty") }
-            return HostFilter(host: host, modifier: try child.compile())
+            return HostFilter(host: host, modifier: try child.compile(verifications: verifications))
         case .methodFilter(let methods, let child):
             guard !methods.isEmpty, methods.allSatisfy({ !$0.isEmpty }) else {
                 throw ProxyError.invalidHTTP("method filter requires at least one method")
             }
-            return MethodFilter(methods: methods, modifier: try child.compile())
+            return MethodFilter(methods: methods, modifier: try child.compile(verifications: verifications))
         case .urlFilter(let host, let pathPrefix, let child):
             guard host != nil || pathPrefix != nil else {
                 throw ProxyError.invalidHTTP("URL filter requires host and/or pathPrefix")
@@ -239,7 +356,8 @@ public indirect enum ModifierSpec: Codable, Sendable {
             if let pathPrefix, !pathPrefix.hasPrefix("/") {
                 throw ProxyError.invalidHTTP("URL filter pathPrefix must start with /")
             }
-            return URLFilter(host: host, pathPrefix: pathPrefix, modifier: try child.compile())
+            return URLFilter(
+                host: host, pathPrefix: pathPrefix, modifier: try child.compile(verifications: verifications))
         case .status(let statusCode, let reason):
             guard (100...599).contains(statusCode), reason?.contains("\r") != true,
                 reason?.contains("\n") != true
@@ -305,7 +423,7 @@ public indirect enum ModifierSpec: Codable, Sendable {
                 contentType: contentType ?? "text/plain; charset=utf-8")
         case .ipFilter(let networks, let child):
             guard !networks.isEmpty else { throw ProxyError.invalidHTTP("IP filter requires networks") }
-            return try IPFilter(networks: networks, modifier: child.compile())
+            return try IPFilter(networks: networks, modifier: child.compile(verifications: verifications))
         case .cors(
             let allowOrigin, let allowMethods, let allowHeaders, let exposeHeaders,
             let allowCredentials, let maxAge):
@@ -324,7 +442,6 @@ public indirect enum ModifierSpec: Codable, Sendable {
     }
 }
 
-/// A timestamped mismatch recorded by the runtime traffic verifier.
 public struct VerificationFailure: Codable, Sendable {
     public let timestamp: Date
     public let message: String
@@ -332,9 +449,8 @@ public struct VerificationFailure: Codable, Sendable {
 
 /// Mutable control-plane state.
 ///
-/// It is both a Modifier and a TrafficLogger so runtime rules remain isolated from the proxy transport.
-/// The lock protects configuration, compiled rules, and verification failures. Modification takes a
-/// rule snapshot under the lock and invokes its Sendable modifiers after releasing the lock.
+/// It is both a Modifier and a TrafficLogger so
+/// runtime rules remain isolated from the proxy transport.
 public final class RuntimeConfiguration: Modifier, TrafficLogger, @unchecked Sendable {
     private let lock = NSLock()
     private var document = RuntimeConfigurationDocument(
@@ -344,13 +460,22 @@ public final class RuntimeConfiguration: Modifier, TrafficLogger, @unchecked Sen
     private var compiled: any Modifier = ModifierGroup([])
     private var failures: [VerificationFailure] = []
     private var martianConfiguration: Data?
+    private var verifications = VerificationStore()
+    private let bindingID = UUID()
 
-    /// Starts with no modifications, verification expectations, or rate overrides.
-    public init() {}
+    public let trafficShaping = TrafficShapingController()
 
-    /// Validates and atomically replaces rules, clearing previous verification failures.
-    ///
-    /// Throws for invalid rules or rates; the previous configuration remains active on failure.
+    private let modifierLogCapture: BodyCapturePolicy
+    private let modifierLogSink: @Sendable (String) -> Void
+
+    public init(
+        modifierLogSink: @escaping @Sendable (String) -> Void = { print($0) },
+        modifierLogCapture: BodyCapturePolicy = BodyCapturePolicy()
+    ) {
+        self.modifierLogSink = modifierLogSink
+        self.modifierLogCapture = modifierLogCapture
+    }
+
     public func replace(with next: RuntimeConfigurationDocument) throws {
         let statusRules = next.verifyStatus ?? [:]
         guard statusRules.values.allSatisfy({ (100...599).contains($0) }) else {
@@ -365,6 +490,7 @@ public final class RuntimeConfiguration: Modifier, TrafficLogger, @unchecked Sen
         guard headerRules.allSatisfy({ HTTPHead.isValidHeader(name: $0.name, value: $0.value ?? "") }) else {
             throw ProxyError.invalidHTTP("header verification contains an invalid name or value")
         }
+        let nextVerifications = VerificationStore()
         var modifiers: [any Modifier] = []
         for (name, value) in next.requestHeaders ?? [:] {
             modifiers.append(HeaderModifier(scope: .request, name: name, value: value))
@@ -372,7 +498,7 @@ public final class RuntimeConfiguration: Modifier, TrafficLogger, @unchecked Sen
         for (name, value) in next.responseHeaders ?? [:] {
             modifiers.append(HeaderModifier(scope: .response, name: name, value: value))
         }
-        if let spec = next.modifier { modifiers.append(try spec.compile()) }
+        if let spec = next.modifier { modifiers.append(try spec.compile(verifications: nextVerifications)) }
         let nextCompiled = ModifierGroup(modifiers)
         lock.withLock {
             document = RuntimeConfigurationDocument(
@@ -385,50 +511,48 @@ public final class RuntimeConfiguration: Modifier, TrafficLogger, @unchecked Sen
                 verifyRequestHeaders: next.verifyRequestHeaders ?? [:],
                 verifyResponseHeaders: next.verifyResponseHeaders ?? [:])
             compiled = nextCompiled
+            verifications = nextVerifications
             martianConfiguration = nil
             failures.removeAll(keepingCapacity: true)
         }
     }
 
-    /// Installs a supported canonical Martian modifier tree and clears verification failures.
-    ///
-    /// Existing Jovian verification rules and traffic rates remain active. Unsupported or malformed
-    /// input throws before the active modifier changes.
     public func replace(martianJSON: Data) throws {
-        let nextCompiled = try MartianConfigurationParser.parse(martianJSON)
+        let nextVerifications = VerificationStore()
+        let nextCompiled = try MartianConfigurationParser.parse(
+            martianJSON, verifications: nextVerifications, logSink: modifierLogSink, logCapture: modifierLogCapture)
         let normalized = try JSONSerialization.data(
             withJSONObject: JSONSerialization.jsonObject(with: martianJSON), options: [.prettyPrinted, .sortedKeys])
         lock.withLock {
             compiled = nextCompiled
+            verifications = nextVerifications
+            document = RuntimeConfigurationDocument()
             martianConfiguration = normalized
             failures.removeAll(keepingCapacity: true)
         }
     }
 
-    /// Encodes the installed Martian document, or the current Jovian document when none is installed.
     public func encodedConfiguration() throws -> Data {
-        if let martian = lock.withLock({ martianConfiguration }) { return martian }
+        let (martian, native) = lock.withLock { (martianConfiguration, document) }
+        if let martian { return martian }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(snapshot())
+        return try encoder.encode(native)
     }
 
-    /// Returns the Jovian document, which does not represent a separately installed Martian tree.
     public func snapshot() -> RuntimeConfigurationDocument { lock.withLock { document } }
 
-    /// Applies a snapshot of request modifiers, suppressing thrown modifier errors.
-    public func modify(request: inout RequestContext) {
+    public func modify(request: inout RequestContext) throws {
         let modifier = lock.withLock { compiled }
-        try? modifier.modify(request: &request)
+        request.configurationModifiers[bindingID] = modifier
+        try modifier.modify(request: &request)
     }
 
-    /// Applies a snapshot of response modifiers, suppressing thrown modifier errors.
-    public func modify(response: inout ResponseContext) {
-        let modifier = lock.withLock { compiled }
-        try? modifier.modify(response: &response)
+    public func modify(response: inout ResponseContext) throws {
+        let modifier = response.configurationModifiers[bindingID] ?? lock.withLock { compiled }
+        try modifier.modify(response: &response)
     }
 
-    /// Verifies successful exchanges against host rules and appends any observed mismatches.
     public func record(_ entry: TrafficEntry) {
         guard entry.error == nil, entry.status > 0, let host = Self.host(from: entry.target) else { return }
         lock.withLock {
@@ -461,11 +585,15 @@ public final class RuntimeConfiguration: Modifier, TrafficLogger, @unchecked Sen
         }
     }
 
-    /// Returns a snapshot of all mismatches retained since the last replacement or reset.
-    public func verificationFailures() -> [VerificationFailure] { lock.withLock { failures } }
-    /// Clears mismatches while preserving active configuration.
-    public func resetVerificationFailures() { lock.withLock { failures.removeAll(keepingCapacity: true) } }
-    /// Returns upload and download overrides in bytes per second; `nil` leaves the server default active.
+    public func verificationFailures() -> [VerificationFailure] {
+        lock.withLock { failures + verifications.snapshot() }
+    }
+    public func resetVerificationFailures() {
+        lock.withLock {
+            failures.removeAll(keepingCapacity: true)
+            verifications.reset()
+        }
+    }
     public func trafficRates() -> (upload: Int?, download: Int?) {
         lock.withLock { (document.uploadBytesPerSecond, document.downloadBytesPerSecond) }
     }

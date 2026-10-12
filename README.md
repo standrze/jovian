@@ -8,6 +8,12 @@ A standalone Swift HTTP proxy library and command-line application modeled after
 - SwiftNIO owns socket transport and HTTP framing; NIOSSL owns TLS; maintained Apple packages
   provide logging, collections, cryptography, and certificate parsing.
 
+The consolidated 0.3.0 version includes all 33 canonical Martian rule names,
+HTTP/HTTPS/SOCKS5 upstream proxies, URL and port rewriting, local static mocks
+and ranges, verifiers, traffic shaping, streaming diagnostics, optional redacted
+HAR bodies, dynamic TLS interception, and origin-scoped sessions. See the
+[compatibility matrix](Documentation/martian-compatibility.md) for deliberate limits.
+
 Requires Swift 6.4 and macOS 13 or later. The package has no runtime dependency
 on ono-sendai or lowlight.
 
@@ -19,6 +25,8 @@ cd jovian
 swift build
 swift run jovian serve
 swift run jovian certificate /path/to/certificate.pem
+swift run jovian ca create --directory /tmp/jovian-ca
+swift run jovian serve --intercept-ca /tmp/jovian-ca --upstream-proxy socks5h://127.0.0.1:1080
 swift test
 ```
 

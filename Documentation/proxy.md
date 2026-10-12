@@ -330,3 +330,43 @@ connection reuse, upgrades, and the public API migration.
   the current test fixtures.
 
 Use this software only for traffic and systems you are authorized to test.
+
+## Consolidated features
+
+The original Jovian options remain supported. `--upstream-proxy` aliases
+`--downstream-proxy-url` and adds `socks5` / `socks5h` (remote DNS).
+Use `--upstream-proxy-user` with `--upstream-proxy-password-env` to keep next-hop
+credentials out of URLs. `--upstream-proxy-ca` supplies PEM next-hop trust without
+changing origin trust. No failed next hop falls back to a direct connection.
+
+`jovian ca create --directory DIR` creates a persistent authority;
+`jovian ca issue HOST --directory DIR` exports a local TLS identity.
+`--intercept-ca DIR` loads it for interception, and `--tls-ca DIR` loads it
+for SNI-based proxy TLS. Static listener identities use `--tls-cert` / `--tls-key`.
+These commands do not install any system trust.
+
+`--har-bodies`, `--har-body-limit`, `--har-body-budget`, and repeated
+`--body-redact-field` opt into bounded redacted HAR bodies. The default omits
+bodies. `--api-cors` enables control CORS. Both the admin listener and reserved
+`http://martian.proxy/` expose configuration, verification, logs, traffic
+shaping, and public authority export. Proxy authentication applies to the
+reserved host; the separate admin listener remains a local trusted interface.
+
+`jovian sessions new NAME --origin URL [--retain-bodies]` creates a bounded store.
+`list`, `show`, `close`, `resume`, `delete`, and `retention` manage it.
+`serve --session NAME` checks the origin before and after edits and records
+traffic. `--sessions-directory DIR` and `JOVIAN_SESSIONS_DIR` choose storage.
+The direct request API is `JovianRequestExecutor`; it does not follow redirects.
+
+The CLI returns 502 on modifier errors. Existing library callers retain warning
+and forwarding behavior by default; choose `failOnModifierError: true` for the
+CLI policy. RuntimeConfiguration and HeaderModifier now expose throwing modifier
+methods, so direct calls need `try`. Explicit body replacements now also work
+on streamed sources; replaced unread bodies retire their channels instead of
+blocking on a drain.
+
+Examples and behavior limits:
+[Routing](Routing.md), [Mocking and verification](MockingAndVerification.md),
+[Logging and listeners](MartianCompletion.md),
+[Headers and traffic shaping](HeadersAndTrafficShaping.md),
+[Streaming and ranges](ProxyUpgrades.md).

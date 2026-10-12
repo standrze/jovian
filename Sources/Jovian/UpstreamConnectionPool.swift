@@ -52,15 +52,16 @@ actor UpstreamConnectionPool {
         }
         if let proxy = downstreamProxy {
             let connection = try await connect(
-                host: proxy.host, port: proxy.port, role: .client, usesTLS: proxy.usesTLS, deadline: deadline)
-            if usesTLS {
+                host: proxy.host, port: proxy.port, role: proxy.usesHTTPForwarding ? .client : .raw,
+                usesTLS: proxy.usesTLS, deadline: deadline, proxyHop: true)
+            if usesTLS || !proxy.usesHTTPForwarding {
                 do {
                     let response = try await establishTunnel(connection, host: host, port: port)
                     guard (200..<300).contains(response.status.code) else {
                         throw ProxyError.connection("downstream CONNECT returned \(response.status.code)")
                     }
                     try await connection.becomeHTTP(
-                        role: .client, tls: .client(try upstreamTLSContext(), serverHostname: host))
+                        role: .client, tls: usesTLS ? .client(try upstreamTLSContext(), serverHostname: host) : nil)
                 } catch {
                     connection.close()
                     throw error
@@ -73,11 +74,12 @@ actor UpstreamConnectionPool {
 
     func connect(
         host: String, port: Int, role: ChannelConnection.Role, usesTLS: Bool = false,
-        deadline: RequestDeadline? = nil
+        deadline: RequestDeadline? = nil, proxyHop: Bool = false
     ) async throws -> ChannelConnection {
         guard !stopped else { throw ProxyError.connection("proxy has stopped") }
         try Task.checkCancellation()
-        let tls: TLSConnectionMode? = usesTLS ? .client(try upstreamTLSContext(), serverHostname: host) : nil
+        let context = usesTLS ? try (proxyHop ? proxyTLSContext() : upstreamTLSContext()) : nil
+        let tls: TLSConnectionMode? = context.map { .client($0, serverHostname: host) }
         let connection = try await ClientBootstrap(group: group)
             .channelOption(ChannelOptions.autoRead, value: false)
             .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
@@ -123,10 +125,22 @@ actor UpstreamConnectionPool {
         return context
     }
 
+    private func proxyTLSContext() throws -> NIOSSLContext {
+        if let roots = downstreamProxy?.trustRootsPEM {
+            return try ProxyTLSConfiguration(trustRootsPEM: roots).upstreamContext
+        }
+        return try upstreamTLSContext()
+    }
+
     /// A successful CONNECT switches the proxy connection to opaque bytes, retaining any early payload.
     func establishTunnel(
         _ connection: ChannelConnection, host: String, port: Int, headers: HTTPHeaders = HTTPHeaders()
     ) async throws -> HTTPResponseHead {
+        if let proxy = downstreamProxy, !proxy.usesHTTPForwarding {
+            try await SOCKS5Handshake.connect(
+                connection: connection, host: host, port: UInt16(port), credentials: proxy.credentials)
+            return HTTPResponseHead(version: .http1_1, status: .ok)
+        }
         let authority = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
         var headers = headers
         headers.replaceOrAdd(name: "Host", value: authority)
@@ -139,11 +153,18 @@ actor UpstreamConnectionPool {
             HTTPClientRequestPart.head(
                 HTTPRequestHead(version: .http1_1, method: .CONNECT, uri: authority, headers: headers)))
         try await connection.write(HTTPClientRequestPart.end(nil))
+        var informationals = 0
         while let event = try await connection.next() {
             guard case .response(let head) = event else {
                 throw ProxyError.invalidHTTP("expected downstream CONNECT response")
             }
-            if head.status.code < 200 { continue }
+            if head.status.code < 200 {
+                informationals += 1
+                guard head.status.code != 101, informationals <= 16 else {
+                    throw ProxyError.invalidHTTP("invalid CONNECT informational response")
+                }
+                continue
+            }
             if (200..<300).contains(head.status.code) {
                 guard case .end? = try await connection.next() else {
                     throw ProxyError.invalidHTTP("invalid downstream CONNECT response")

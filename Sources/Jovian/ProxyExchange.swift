@@ -18,7 +18,7 @@ extension ProxyServer {
         async throws -> Bool
     {
         let original = HTTPHead(initialHead)
-        let method = initialHead.method.rawValue
+        var method = initialHead.method.rawValue
         let requestedUpgrade = original.connectionTokens().contains("upgrade") && original["Upgrade"] != nil
         let collected = try await collectBody(from: client, expectedLength: Int(original["Content-Length"] ?? ""))
         let initial = RequestContext(
@@ -29,18 +29,39 @@ extension ProxyServer {
             request.head.removeHopByHopHeaders(preservingUpgrade: requestedUpgrade)
             request.head.remove("Expect")
             addForwardingHeaders(to: &request, version: initialHead.version)
+            let transportVia = request.head.values(for: "Via")
             do { try modifier.modify(request: &request) } catch {
+                if failOnModifierError { throw error }
                 addModifierWarning(error, to: &request.head)
             }
+            let configurationModifiers = request.configurationModifiers
+            let streamingLog = request.streamingLog
             if let interceptor {
                 switch interceptor.intercept(request) {
                 case .forward(let forwarded): request = forwarded
                 case .drop(let response): request.syntheticResponse = response
                 }
             }
+            request.configurationModifiers = configurationModifiers
+            request.streamingLog = streamingLog
+            try session?.validate(method: request.method, target: request.target)
+            // A rule cannot remove the instance identity used to detect chained loops.
+            request.head.replaceValues(for: "Via", with: transportVia)
+            ensureVia(&request.head)
             return request
         }
+        var responseCapture: StreamingMessageCapture?
+        var partialWriter: PayloadWriter?
+        var partialHead: HTTPHead?
+        var partialRequestBody: Data?
+        var requestComplete = false
+        var responseComplete = false
+        defer {
+            request.streamingLog?.finish(complete: requestComplete)
+            responseCapture?.finish(complete: responseComplete)
+        }
         do {
+            method = request.method
             request.head.removeHopByHopHeaders(preservingUpgrade: requestedUpgrade)
             request.head["Connection"] = requestedUpgrade ? "Upgrade" : "keep-alive"
             let requestTrailers = request.body == collected.body ? collected.trailers : nil
@@ -48,8 +69,10 @@ extension ProxyServer {
                 &request.head, body: request.body, streamingChunked: original["Transfer-Encoding"] != nil,
                 trailers: requestTrailers)
             let rates = trafficRates()
-            var upload = TransferPacer(bytesPerSecond: rates.upload)
             var download = TransferPacer(bytesPerSecond: rates.download)
+            if request.skipRoundTrip && request.syntheticResponse == nil {
+                request.syntheticResponse = SyntheticResponse(statusCode: 200, reason: "OK")
+            }
             if let synthetic = request.syntheticResponse {
                 return try await syntheticResponse(
                     synthetic, request: request, client: client,
@@ -58,44 +81,68 @@ extension ProxyServer {
             }
             let destination = try destination(
                 target: request.target, hostHeader: request.head["Host"], defaultScheme: defaultScheme)
+            let originalDestination = try self.destination(
+                target: initialHead.uri, hostHeader: original["Host"], defaultScheme: defaultScheme)
+            if originalDestination.host.lowercased() != destination.host.lowercased()
+                || originalDestination.port != destination.port || originalDestination.usesTLS != destination.usesTLS
+            {
+                for name in ["Authorization", "Cookie"]
+                where request.head.values(for: name) == original.values(for: name) { request.head.remove(name) }
+            }
+            if request.head["Host"]?.isEmpty != false {
+                request.head["Host"] = try RoutingTarget(request.target).authority
+            }
             let upstream = try await upstreamPool.acquire(
                 host: destination.host, port: destination.port, usesTLS: destination.usesTLS, deadline: deadline)
             var reused = false
             defer { if !reused { upstream.close() } }
             var wireHead = try request.head.requestHead(
                 method: method,
-                uri: downstreamProxy != nil && !destination.usesTLS ? request.target : originForm(request.target),
+                uri: downstreamProxy?.usesHTTPForwarding == true && !destination.usesTLS
+                    ? request.target : originForm(request.target),
                 version: initialHead.version)
-            if let downstreamProxy, !destination.usesTLS, let authorization = downstreamProxy.authorization {
+            if let downstreamProxy, downstreamProxy.usesHTTPForwarding, !destination.usesTLS,
+                let authorization = downstreamProxy.authorization
+            {
                 wireHead.headers.replaceOrAdd(name: "Proxy-Authorization", value: authorization)
             }
             try await upstream.write(HTTPClientRequestPart.head(wireHead))
+            var capturedRequest = Data()
+            func retainRequest(_ data: Data) {
+                if capturedRequest.count < maximumBufferedBodyBytes {
+                    capturedRequest.append(data.prefix(maximumBufferedBodyBytes - capturedRequest.count))
+                }
+            }
+            let uploadWriter = try PayloadWriter(
+                connection: upstream, upload: true, controller: runtimeConfiguration?.trafficShaping,
+                target: request.target, head: request.head, rate: rates.upload, capture: request.streamingLog,
+                latencyConnection: client)
             if let body = request.body {
-                try await upload.pace(body.count)
-                try await upstream.write(HTTPClientRequestPart.body(.byteBuffer(ByteBuffer(bytes: body))))
-                if !collected.complete { try await drainBody(from: client) }
+                retainRequest(body)
+                try await uploadWriter.write(body)
+                // Replaced unread uploads are closed after this response rather than blocking on a drain.
                 try await upstream.write(HTTPClientRequestPart.end(requestTrailers))
             } else {
-                if !collected.prefix.isEmpty {
-                    try await upload.pace(collected.prefix.count)
-                    try await upstream.write(
-                        HTTPClientRequestPart.body(.byteBuffer(ByteBuffer(bytes: collected.prefix))))
-                }
+                retainRequest(collected.prefix)
+                try await uploadWriter.write(collected.prefix)
                 while true {
                     guard let event = try await client.next() else {
                         throw ProxyError.invalidHTTP("request body ended early")
                     }
                     switch event {
                     case .body(let bytes):
-                        try await upload.pace(bytes.readableBytes)
-                        try await upstream.write(HTTPClientRequestPart.body(.byteBuffer(bytes)))
-                    case .end(let trailers):
-                        try await upstream.write(HTTPClientRequestPart.end(trailers))
+                        let data = Data(bytes.readableBytesView)
+                        retainRequest(data)
+                        try await uploadWriter.write(data)
+                    case .end(let trailers): try await upstream.write(HTTPClientRequestPart.end(trailers))
                     default: throw ProxyError.invalidHTTP("unexpected request part")
                     }
                     if case .end = event { break }
                 }
             }
+            partialRequestBody = capturedRequest
+            requestComplete = true
+            request.streamingLog?.finish(complete: true)
             let head = try await finalResponseHead(from: upstream, to: client)
             if head.status.code == 101 {
                 guard requestedUpgrade,
@@ -109,8 +156,8 @@ extension ProxyServer {
                 }
                 let context = ResponseContext(
                     requestMethod: method, target: request.target, head: HTTPHead(head), body: nil,
-                    remoteAddress: client.channel.remoteAddress?.ipAddress)
-                var response = try await modifyResponse(context)
+                    remoteAddress: client.channel.remoteAddress?.ipAddress, requestHead: request.head)
+                var response = try await modifyResponse(context, request: request)
                 response.head.removeHopByHopHeaders(preservingUpgrade: true)
                 response.head["Connection"] = "Upgrade"
                 let outgoing = try response.head.responseHead(version: initialHead.version)
@@ -127,91 +174,123 @@ extension ProxyServer {
                     requestBody: request.body)
                 return false
             }
-            let upstreamHasNoBody = method == "HEAD" || head.status.code == 204 || head.status.code == 304
+            let upstreamHasNoBody =
+                method == "HEAD" || head.status.code == 204 || head.status.code == 205 || head.status.code == 304
             let responseBody = try await collectBody(
                 from: upstream,
                 expectedLength: upstreamHasNoBody ? 0 : Int(head.headers.first(name: "Content-Length") ?? ""),
                 forceStreaming: !upstreamHasNoBody && head.headers.contains(name: "Transfer-Encoding"))
             let context = ResponseContext(
                 requestMethod: method, target: request.target, head: HTTPHead(head), body: responseBody.body,
-                remoteAddress: client.channel.remoteAddress?.ipAddress)
-            var response = try await modifyResponse(context)
+                remoteAddress: client.channel.remoteAddress?.ipAddress, requestHead: request.head)
+            var response = try await modifyResponse(context, request: request)
+            responseCapture = response.streamingLog
             response.head.removeHopByHopHeaders()
             let status = try response.head.responseHead().status.code
-            let noBody = method == "HEAD" || status == 204 || status == 304
+            guard (200...599).contains(status) else {
+                throw ResponseModifierFailure(
+                    underlying: ProxyError.invalidHTTP("modifier must produce a final response status"))
+            }
+            let noBody = method == "HEAD" || status == 204 || status == 205 || status == 304
             let responseTrailers = response.body == responseBody.body ? responseBody.trailers : nil
             let chunked = initialHead.version != .http1_0
             let keepAlive =
-                initialHead.isKeepAlive && !requestedUpgrade && !transport.isClosing
-                && (noBody || response.body != nil || chunked || response.head["Content-Length"] != nil)
+                initialHead.isKeepAlive && (collected.complete || request.body == nil) && !requestedUpgrade
+                && !transport.isClosing
+                && (noBody || response.body != nil || response.bodyStream != nil || chunked
+                    || response.head["Content-Length"] != nil)
             response.head["Connection"] = keepAlive ? "keep-alive" : "close"
             if noBody {
                 response.head.remove("Transfer-Encoding")
                 if status == 204 { response.head.remove("Content-Length") }
+                if status == 205 { response.head["Content-Length"] = "0" }
                 response.body = Data()
             } else {
-                normalizeBodyHeaders(
-                    &response.head, body: response.body, streamingChunked: chunked,
-                    trailers: chunked ? responseTrailers : nil)
+                if let stream = response.bodyStream {
+                    response.head.remove("Transfer-Encoding")
+                    response.head.remove("Trailer")
+                    response.head["Content-Length"] = String(stream.length)
+                } else {
+                    normalizeBodyHeaders(
+                        &response.head, body: response.body, streamingChunked: chunked,
+                        trailers: chunked ? responseTrailers : nil)
+                }
                 if !chunked { response.head.remove("Transfer-Encoding") }
             }
             let outgoing = try response.head.responseHead(version: initialHead.version)
             try await client.write(HTTPServerResponsePart.head(outgoing))
             var captured = Data()
-            var byteCount = 0
-            if let body = response.body {
-                if !noBody {
-                    captured = Data(body.prefix(maximumBufferedBodyBytes))
-                    byteCount = body.count
-                    try await download.pace(body.count)
-                    try await client.write(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body))))
+            let downloadWriter = try PayloadWriter(
+                connection: client, controller: runtimeConfiguration?.trafficShaping,
+                target: request.target, head: response.head, rate: rates.download, capture: response.streamingLog)
+            partialWriter = downloadWriter
+            partialHead = response.head
+            func retain(_ bytes: Data) {
+                if captured.count < maximumBufferedBodyBytes {
+                    captured.append(bytes.prefix(maximumBufferedBodyBytes - captured.count))
                 }
-                if !responseBody.complete { try await drainBody(from: upstream) }
+            }
+            var consumed = responseBody.complete
+            if let stream = response.bodyStream, !noBody {
+                while let chunk = try await transport.workers.runIfActive({ try stream.read(maximum: 32_768) }) {
+                    retain(chunk)
+                    try await downloadWriter.write(chunk)
+                }
+                try await client.write(HTTPServerResponsePart.end(nil))
+            } else if let body = response.body {
+                if !noBody {
+                    retain(body)
+                    try await downloadWriter.write(body)
+                }
                 try await client.write(HTTPServerResponsePart.end(noBody || !chunked ? nil : responseTrailers))
             } else {
-                captured = Data(responseBody.prefix.prefix(maximumBufferedBodyBytes))
-                byteCount = responseBody.prefix.count
-                if !responseBody.prefix.isEmpty {
-                    try await download.pace(responseBody.prefix.count)
-                    try await client.write(
-                        HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: responseBody.prefix))))
-                }
+                retain(responseBody.prefix)
+                try await downloadWriter.write(responseBody.prefix)
                 while true {
                     guard let event = try await upstream.next() else {
                         throw ProxyError.invalidHTTP("response body ended early")
                     }
                     switch event {
                     case .body(let bytes):
-                        byteCount += bytes.readableBytes
-                        if captured.count < maximumBufferedBodyBytes {
-                            captured.append(
-                                contentsOf: bytes.readableBytesView.prefix(maximumBufferedBodyBytes - captured.count))
-                        }
-                        try await download.pace(bytes.readableBytes)
-                        try await client.write(HTTPServerResponsePart.body(.byteBuffer(bytes)))
+                        let data = Data(bytes.readableBytesView)
+                        retain(data)
+                        try await downloadWriter.write(data)
                     case .end(let trailers):
+                        consumed = true
                         try await client.write(HTTPServerResponsePart.end(chunked ? trailers : nil))
                     default: throw ProxyError.invalidHTTP("unexpected response part")
                     }
                     if case .end = event { break }
                 }
             }
+            responseComplete = true
+            response.streamingLog?.finish(complete: true)
+            let byteCount = downloadWriter.bytesSent
             await record(
                 method: method, target: request.target, status: Int(outgoing.status.code), bytes: byteCount,
                 start: started,
                 transport: "http",
                 requestHeaders: redacted(request.head.headers), responseHeaders: redacted(response.head.headers),
-                requestBody: request.body,
-                responseBody: captured, requestBodyTruncated: request.body == nil,
+                requestBody: capturedRequest,
+                responseBody: captured, requestBodyTruncated: uploadWriter.bytesSent > capturedRequest.count,
                 responseBodyTruncated: byteCount > captured.count)
             deadline.finish()
-            if head.isKeepAlive {
+            if head.isKeepAlive && consumed {
                 await upstreamPool.release(
                     upstream, host: destination.host, port: destination.port, usesTLS: destination.usesTLS)
                 reused = true
             }
             return keepAlive
         } catch {
+            if case TrafficShapingError.recordedClose = error { throw error }
+            if case TrafficShapingError.forcedClose = error, let writer = partialWriter, let head = partialHead {
+                await record(
+                    method: request.method, target: request.target, status: Int(try head.responseHead().status.code),
+                    bytes: writer.bytesSent, start: started, transport: "http", error: "traffic shaping forced close",
+                    requestHeaders: redacted(request.head.headers), responseHeaders: redacted(head.headers),
+                    requestBody: partialRequestBody, responseBodyTruncated: true)
+                throw TrafficShapingError.recordedClose
+            }
             throw ProxyExchangeFailure(underlying: error, request: request)
         }
     }
@@ -258,13 +337,15 @@ extension ProxyServer {
         throw ProxyError.invalidHTTP("upstream closed before a final response")
     }
 
-    func modifyResponse(_ initial: ResponseContext) async throws -> ResponseContext {
+    func modifyResponse(_ initial: ResponseContext, request: RequestContext? = nil) async throws -> ResponseContext {
         try await transport.workers.runIfActive { [self] in
             var response = initial
+            if let request { response.configurationModifiers = request.configurationModifiers }
             do { try modifier.modify(response: &response) } catch {
+                if failOnModifierError { throw ResponseModifierFailure(underlying: error) }
                 addModifierWarning(error, to: &response.head)
             }
-            response.head.add(name: "Via", value: "1.1 \(viaIdentity)")
+            ensureVia(&response.head)
             return response
         }
     }
@@ -288,40 +369,72 @@ extension ProxyServer {
     func syntheticResponse(
         _ synthetic: SyntheticResponse, request: RequestContext, client: ChannelConnection,
         keepAlive: Bool, started: ContinuousClock.Instant, pacer: inout TransferPacer,
-        error: String? = nil, transportName: String = "synthetic"
+        error: String? = nil, transportName: String = "synthetic", applyModifiers: Bool = true
     ) async throws -> Bool {
         let initial = ResponseContext(
             requestMethod: request.method, target: request.target,
             head: HTTPHead(
                 startLine: "HTTP/1.1 \(synthetic.statusCode) \(synthetic.reason)", headers: synthetic.headers),
             body: synthetic.body,
-            remoteAddress: client.channel.remoteAddress?.ipAddress)
-        var response = try await modifyResponse(initial)
+            remoteAddress: client.channel.remoteAddress?.ipAddress, requestHead: request.head)
+        var response = applyModifiers ? try await modifyResponse(initial, request: request) : initial
         let body = response.body ?? Data()
         response.head.removeHopByHopHeaders()
         normalizeBodyHeaders(&response.head, body: body, streamingChunked: false)
+        if let stream = response.bodyStream { response.head["Content-Length"] = String(stream.length) }
         response.head["Connection"] = keepAlive ? "keep-alive" : "close"
         let status = try response.head.responseHead().status.code
-        let noBody = request.method == "HEAD" || status == 204 || status == 304
+        guard (200...599).contains(status) else {
+            throw ResponseModifierFailure(
+                underlying: ProxyError.invalidHTTP("modifier must produce a final response status"))
+        }
+        let noBody = request.method == "HEAD" || status == 204 || status == 205 || status == 304
         if noBody {
             response.head.remove("Transfer-Encoding")
             if status == 204 { response.head.remove("Content-Length") }
+            if status == 205 { response.head["Content-Length"] = "0" }
         }
         let head = try response.head.responseHead()
         try await client.write(HTTPServerResponsePart.head(head))
-        if !noBody {
-            try await pacer.pace(body.count)
-            try await client.write(HTTPServerResponsePart.body(.byteBuffer(ByteBuffer(bytes: body))))
+        let writer = try PayloadWriter(
+            connection: client, controller: runtimeConfiguration?.trafficShaping,
+            target: request.target, head: response.head, rate: trafficRates().download, capture: response.streamingLog)
+        var captured = Data()
+        defer { response.streamingLog?.finish(complete: false) }
+        do {
+            if !noBody {
+                if let stream = response.bodyStream {
+                    while let chunk = try await transport.workers.runIfActive({ try stream.read(maximum: 32_768) }) {
+                        if captured.count < maximumBufferedBodyBytes {
+                            captured.append(chunk.prefix(maximumBufferedBodyBytes - captured.count))
+                        }
+                        try await writer.write(chunk)
+                    }
+                } else {
+                    captured = Data(body.prefix(maximumBufferedBodyBytes))
+                    try await writer.write(body)
+                }
+            }
+            try await client.write(HTTPServerResponsePart.end(nil))
+            response.streamingLog?.finish(complete: true)
+        } catch TrafficShapingError.forcedClose {
+            await record(
+                method: request.method, target: request.target, status: Int(head.status.code),
+                bytes: writer.bytesSent, start: started, transport: transportName,
+                error: "traffic shaping forced close",
+                requestHeaders: redacted(request.head.headers), responseHeaders: redacted(response.head.headers),
+                requestBody: request.body, responseBody: Data(captured.prefix(writer.bytesSent)),
+                requestBodyTruncated: request.body == nil, responseBodyTruncated: true)
+            throw TrafficShapingError.recordedClose
         }
-        try await client.write(HTTPServerResponsePart.end(nil))
         await record(
             method: request.method, target: request.target, status: Int(head.status.code),
-            bytes: noBody ? 0 : body.count,
+            bytes: writer.bytesSent,
             start: started, transport: transportName, error: error, requestHeaders: redacted(request.head.headers),
             responseHeaders: redacted(response.head.headers),
-            requestBody: request.body, responseBody: noBody ? Data() : Data(body.prefix(maximumBufferedBodyBytes)),
+            requestBody: request.body, responseBody: captured,
             requestBodyTruncated: request.body == nil,
-            responseBodyTruncated: !noBody && body.count > maximumBufferedBodyBytes)
+            responseBodyTruncated: writer.bytesSent > captured.count)
         return keepAlive
     }
 
@@ -363,4 +476,9 @@ extension ProxyServer {
 struct ProxyExchangeFailure: Error {
     let underlying: Error
     let request: RequestContext
+}
+
+struct ResponseModifierFailure: Error, CustomStringConvertible {
+    let underlying: Error
+    var description: String { String(describing: underlying) }
 }
