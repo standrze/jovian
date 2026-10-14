@@ -20,11 +20,9 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio-ssl", from: "2.37.5"),
     ],
     targets: [
-        .systemLibrary(name: "CZlib"),
         .target(
             name: "Jovian",
             dependencies: [
-                "CZlib",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "DequeModule", package: "swift-collections"),
                 .product(name: "Logging", package: "swift-log"),

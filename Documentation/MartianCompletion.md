@@ -92,8 +92,11 @@ A logger snapshots the message at its position in the modifier tree. It prints
 one bounded message per invocation to stdout. Swift callers can supply a
 `RuntimeConfiguration(modifierLogSink:)` closure instead. Multiple matching
 logger nodes produce multiple snapshots. `headersOnly` omits the body entirely.
-`decode` decodes gzip or zlib-wrapped deflate for diagnostics without changing the
-forwarded headers or payload. Decoding is capped at 64 KiB by default; malformed,
+`decode` uses Apple's Compression framework to decode gzip, zlib-wrapped deflate,
+or raw deflate for diagnostics without changing the forwarded headers or payload.
+Gzip/zlib headers and checksums are validated separately from raw DEFLATE decoding.
+As before, trailing bytes and concatenated gzip members are rejected.
+Decoding is capped at 64 KiB by default; malformed,
 unsupported, or oversized encodings yield an explicit marker without failing
 forwarding. Binary snapshots are base64.
 

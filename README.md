@@ -7,6 +7,8 @@ A standalone Swift HTTP proxy library and command-line application modeled after
 - `jovian` provides an Apple ArgumentParser command-line interface.
 - SwiftNIO owns socket transport and HTTP framing; NIOSSL owns TLS; maintained Apple packages
   provide logging, collections, cryptography, and certificate parsing.
+- Apple's Compression framework decodes diagnostic gzip/deflate bodies, with bounded output
+  and gzip/zlib framing and checksum validation. There is no direct zlib library dependency.
 
 The consolidated 0.3.0 version includes all 33 canonical Martian rule names,
 HTTP/HTTPS/SOCKS5 upstream proxies, URL and port rewriting, local static mocks

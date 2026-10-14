@@ -1,4 +1,3 @@
-import CZlib
 import Foundation
 
 /// Opt-in bounded body retention.
@@ -72,42 +71,4 @@ public struct BodyCapturePolicy: Sendable {
 
 extension Data {
     fileprivate func prefixData(_ limit: Int) -> Data { Data(prefix(limit)) }
-}
-
-/// Bounded gzip/zlib decoding used only for diagnostic snapshots, never forwarding.
-enum DiagnosticBodyDecoder {
-    static func decode(_ body: Data, encoding: String?, limit: Int) throws -> Data {
-        guard let encoding, encoding.lowercased() != "identity", !encoding.isEmpty else { return body }
-        guard ["gzip", "x-gzip", "deflate"].contains(encoding.lowercased()) else {
-            throw ProxyError.unsupported("diagnostic content encoding")
-        }
-        guard (0...4 * 1_024 * 1_024).contains(limit), body.count <= Int(UInt32.max) else {
-            throw ProxyError.invalidHTTP("invalid diagnostic decode bound")
-        }
-        func inflateBody(windowBits: Int32) throws -> Data {
-            var stream = z_stream()
-            guard inflateInit2_(&stream, windowBits, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
-                throw ProxyError.invalidHTTP("cannot initialize diagnostic decoder")
-            }
-            defer { inflateEnd(&stream) }
-            var output = [UInt8](repeating: 0, count: limit + 1)
-            let result = body.withUnsafeBytes { input in
-                output.withUnsafeMutableBytes { destination in
-                    stream.next_in = UnsafeMutablePointer(mutating: input.bindMemory(to: UInt8.self).baseAddress)
-                    stream.avail_in = uInt(input.count)
-                    stream.next_out = destination.bindMemory(to: UInt8.self).baseAddress
-                    stream.avail_out = uInt(destination.count)
-                    return inflate(&stream, Z_FINISH)
-                }
-            }
-            guard result == Z_STREAM_END, stream.total_out <= limit, stream.avail_in == 0 else {
-                throw ProxyError.invalidHTTP("diagnostic decode failed or exceeded limit")
-            }
-            return Data(output.prefix(Int(stream.total_out)))
-        }
-        if encoding.lowercased() == "deflate" {
-            do { return try inflateBody(windowBits: 15) } catch { return try inflateBody(windowBits: -15) }
-        }
-        return try inflateBody(windowBits: 31)
-    }
 }
